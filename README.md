@@ -46,7 +46,7 @@ The label side is included: the 112-concept class-level split from the original
 *Concept Bottleneck Models* paper at
 `datasets/CUB/class_attr_data_10/`, plus `attributes.txt` and `concept_names.txt`.
 
-**CUB-Incomplete** is included, at `datasets/CUB/incomplete_data/Mateo_025/`: the 22
+**CUB-Incomplete** is included, at `datasets/CUB/incomplete_data/incomplete_cub/`: the 22
 concepts across 7 groups that remain after retaining 25% of the concept groups, as in
 *Learning to Receive Help: Intervention-Aware Concept Embedding Models*. Its `info.txt` records the removed group names, the
 removed attribute indices and the old→new index mapping. It is shipped rather than
@@ -77,19 +77,19 @@ Every argument is a Hydra override. `+model=` and `+data=` select the config gro
 ```bash
 # Res-SCBM (with L_int) on CUB-Incomplete, R = 20
 python train.py +model=SCBM_RES +data=CUB seed=0 \
-    incomplete=True data.pkl_file_dir=Mateo_025/ \
+    incomplete=True data.pkl_file_dir=incomplete_cub/ \
     data.num_residuals=20 model.use_L_int_extension_loss=True \
     save_model=True
 
 # Res-SCBM w/o L_int: drop the loss flag
 # SCBM / Hard CBM / CEM / black-box DNN:
-python train.py +model=SCBM  +data=CUB seed=0 incomplete=True data.pkl_file_dir=Mateo_025/
-python train.py +model=CBM   +data=CUB seed=0 incomplete=True data.pkl_file_dir=Mateo_025/
-python train.py +model=CEM   +data=CUB seed=0 incomplete=True data.pkl_file_dir=Mateo_025/ model.p_int=0.25
-python train.py +model=DNN   +data=CUB seed=0 incomplete=True data.pkl_file_dir=Mateo_025/
+python train.py +model=SCBM  +data=CUB seed=0 incomplete=True data.pkl_file_dir=incomplete_cub/
+python train.py +model=CBM   +data=CUB seed=0 incomplete=True data.pkl_file_dir=incomplete_cub/
+python train.py +model=CEM   +data=CUB seed=0 incomplete=True data.pkl_file_dir=incomplete_cub/ model.p_int=0.25
+python train.py +model=DNN   +data=CUB seed=0 incomplete=True data.pkl_file_dir=incomplete_cub/
 
 # Linear head on ground-truth concepts (the reference row of Table 1)
-python eval_datasets.py +model=target_head +data=CUB seed=0 incomplete=True data.pkl_file_dir=Mateo_025/
+python eval_datasets.py +model=target_head +data=CUB seed=0 incomplete=True data.pkl_file_dir=incomplete_cub/
 ```
 
 Swap `+data=AwA2` and `data.pkl_file_dir=awa2_incomplete_local_custom_1` for the AwA2
