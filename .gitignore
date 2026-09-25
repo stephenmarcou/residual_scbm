@@ -1,0 +1,29 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+
+# Hydra working directories
+outputs/
+logs/
+
+# Weights & Biases
+wandb/
+
+# Checkpoints and per-split artifact dumps. experiments/ is tracked for the run logs that
+# back the paper's figures and tables (see README section 5); the heavy files a rerun
+# regenerates are not.
+*.pth
+experiments/**/train/
+experiments/**/val/
+experiments/**/train_with_test_transform/
+experiments/**/*_bg_*/
+
+# Datasets: only the concept-incomplete splits and the small metadata files are tracked.
+datasets/CUB/CUB_200_2011/CUB_200_2011/
+datasets/AwA2/JPEGImages/
+datasets/AwA2/Features/
+datasets/TravelingBirds/
+
+pretrained_networks/
+.DS_Store
+.ipynb_checkpoints/

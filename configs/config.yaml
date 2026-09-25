@@ -1,0 +1,85 @@
+experiment_name: 'experiments' # Name of the experiment
+experiment_dir: './experiments/'  # Directory to potentially save the model to
+
+seed: 0 # Random seed
+workers: 2 # Number of workers for data loading
+save_model: False # Whether to save the model. Set to True for inspecting models post training [True, False]
+train_only: False # Whether to train the model only and exit before performing interventions [True, False]
+incomplete: False
+run_inference: False
+run_interventions: False
+num_attribute_groups_remove: 14 # Number of attribute groups to remove when creating incomplete datasets. Only used if incomplete is True. Should be between 0 and 28 for CUB.
+remove_attribute_groups: False # Whether to create an incomplete dataset by removing entire attribute groups, or by randomly removing individual attributes across groups. Only used if incomplete is True. [True, False]
+ratio_attributes_remove: 0.5 # Ratio of attributes to remove when creating incomplete datasets by randomly removing individual attributes across groups. Only used if incomplete is True and remove_attribute_groups is False. Should be between 0 and 1.
+hyperparameter_search: False # Whether to perform hyperparameter search by evaluating the model on the validation set at the end of training and returning the validation metrics without performing inference or interventions [True, False]
+save_name: null # Optional name to add as a prefix to the saved model and the wandb run. 
+
+
+logging:
+  project: 'SCBM' # Name of the wandb project
+  mode: 'disabled' # Whether to log to wandb [online, offline, disabled]
+  entity: "your_entity" # Your wandb entity
+
+inference:
+  ex_name: null
+  save_concept_target_pred: False # Whether to save the predicted concepts and targets for each test set instance during inference [True, False]
+  save_intervention_predictions: False # Whether to dump the per-sample predictions behind every point of
+                                       # the intervention curve, to <run>/intervention_preds<suffix>/<strategy>_<policy>/
+                                       # (step_<n>.pt plus y_true / c_true / img_ids written once). The logged curve is an
+                                       # average over the evaluation split; this is what lets it be re-read within groups
+                                       # afterwards - on Waterbirds, the four (bird, background) cells, where a background
+                                       # shortcut and a concept-driven head are indistinguishable on the average.
+                                       # ~50MB per 200-class run, negligible for a binary target. [True, False]
+  inter_policy: 'random' # What each intervention step adds ['random', 'random_group'].
+                         # 'random': one random not-yet-intervened concept per sample and step (the
+                         # historical curve, x-axis = number of concepts).
+                         # 'random_group': one complete semantic concept group per step, drawn at random
+                         # per batch (CUB family: the 28 ATTRIBUTE_PARTS; AwA2: the 28 CEM groups), so
+                         # the x-axis counts groups and each log line also reports the mean number of
+                         # concepts. On an incomplete run the groups are re-indexed through the split's
+                         # info file, so partially removed groups keep their surviving concepts. Writes
+                         # intervention_log<split>_random_group.txt next to the concept-wise log.
+  propagate_to_residual: True # SCBM_RES only: whether a concept intervention is propagated to the residual
+                              # channel [True, False]. True (default) is the standard SCBM behaviour - the
+                              # bottleneck is one joint Gaussian, so conditioning on the intervened concepts
+                              # moves every other dimension, residuals included. False keeps the
+                              # concept-to-concept propagation (the SCBM part) but does not resample the
+                              # residual at all: the Monte Carlo residual draws of the zero-intervention pass
+                              # are handed to the head unchanged at every point of the curve, so the residual
+                              # is literally the same numbers it was with no intervention and the only thing
+                              # moving along the x-axis is the concept channel. The ablation separates how
+                              # much of an intervention curve comes from correcting the residual from how
+                              # much comes from correcting the concepts. Note this is not a leakage ablation:
+                              # what mu_r(x) encodes about concepts across x is untouched. Writes
+                              # intervention_log<split>_no_res_prop.txt, leaving the standard curve untouched.
+  eval_split: 'test' # Which split to evaluate (and intervene) on ['test', 'val', 'train']. 'val' is the in-distribution
+                     # check for TravelingBirds, whose test split has different backgrounds than train/val.
+                     # Non-'test' splits write to inference_log_<split>.txt / intervention_log_<split>.txt.
+  tb_image_root: null # TravelingBirds only: force the eval_split to be read from this image root
+                      # ['train' = class-correlated background, 'test' = random background] instead of the
+                      # folder matching the split name. The point is paired ID/OOD comparisons on the *same*
+                      # photos: eval_split=test with tb_image_root=train vs =test differ only in background,
+                      # whereas val-vs-test also differs in photographer. Applies to evaluation *and*
+                      # interventions, uses the deterministic test transform, and writes to
+                      # inference_log_<split>_bg_<root>.txt / intervention_log_<split>_bg_<root>.txt with
+                      # artifacts under <split>_bg_<root>/ (same naming as tb_all_renders, with which it
+                      # cannot be combined).
+  noise: # Post-hoc robustness check: corrupt the images of the *evaluation* split only (no retraining;
+         # the intervention strategy is still fitted on the clean train split). CUB family + Waterbirds.
+         # Applied in [0,1] pixel space after CenterCrop/Resize and before ImageNet normalization,
+         # deterministic per (seed, sample). Logs and artifacts get the suffix
+         # _noise_<type>_<amount>: inference_log_noise_salt_pepper_0.05.txt,
+         # intervention_log_noise_salt_pepper_0.05.txt, artifacts under test_noise_salt_pepper_0.05/.
+         # Cannot be combined with tb_all_renders; combines with eval_split and tb_image_root.
+    type: null # [null, 'salt_pepper', 'gaussian']. null = clean evaluation (historical behaviour).
+    amount: 0.05 # salt_pepper: strength lambda of Espinosa Zarlenga et al. (ICML 2025, App. G): lambda/2 of the
+                 # pixel *channels* (R,G,B values, drawn with replacement) set to max, then lambda/2 set to min.
+                 # Their default is 0.1.
+                 # gaussian: std of additive noise in [0,1] pixel units (clipped).
+    seed: 0 # Seed of the corruption, independent of the global seed so two checkpoints see identical noise.
+  tb_all_renders: False # TravelingBirds only: run every split against *both* image roots (train/ = class-correlated
+                        # background, test/ = random background) instead of only the folder matching the split name.
+                        # Covers all 23576 rendered images. Replaces the standard evaluation and the default
+                        # train/val/test_analysis dumps: saves the concept and residual channels to
+                        # <split>_bg_<root>/ (so it requires data.save_concept_and_residual_channel=True) and
+                        # the per-combination metrics to tb_render_sweep_log.txt. [True, False]

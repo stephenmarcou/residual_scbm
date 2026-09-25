@@ -1,0 +1,9 @@
+0	0	black
+1	4	gray
+2	10	stripes
+3	12	hairless
+4	18	flippers
+5	22	paws
+6	68	plains
+7	78	fierce
+8	82	solitary

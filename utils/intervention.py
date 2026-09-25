@@ -1,0 +1,2598 @@
+"""
+Utility functions for intervention of SCBMs and baselines.
+"""
+
+import torch
+from torch import nn
+from torch.utils.data import TensorDataset, DataLoader
+from torch.distributions import MultivariateNormal
+import torch.nn.functional as F
+from scipy.stats import chi2
+from torchmin import minimize
+from tqdm import tqdm
+import wandb
+
+import numpy as np
+
+from pathlib import Path
+
+from utils.data import get_intervention_concept_groups
+from utils.minimize_constraint import minimize_constr
+from utils.utils import numerical_stability_check
+
+
+def dump_intervention_predictions(
+    metrics,
+    save_predictions_dir,
+    strategy,
+    policy,
+    num_intervened,
+    test_loader=None,
+):
+    """Save the per-sample predictions behind one point of an intervention curve.
+
+    The curve in intervention_log.txt is an average over the whole evaluation split, which
+    hides any structure that splits it. On Waterbirds that is the point: a head reading the
+    background and a head reading the bird give the same average accuracy and completely
+    different accuracies within the four (bird, background) cells. Custom_Metrics already
+    accumulates the per-sample tensors needed to recover those, in loader order, so this is
+    only a matter of writing them out before metrics.reset() drops them.
+
+    Row i is sample i of test_loader, which is shuffle-free with drop_last=False, so the rows
+    line up with the evaluation split in dataset order - the same alignment the c_mu / res_mu
+    artifacts saved by inference.py have. img_ids.txt records the dataset's own sample ids
+    next to them, so analysis can join on the id instead of assuming that order held.
+
+    Written under <save_predictions_dir>/<strategy>_<policy>/:
+        step_<n>.pt   {y_pred_logits, c_pred_probs} after n concepts intervened, float16
+        y_true.pt, c_true.pt, img_ids.txt   once, at n = 0 (they do not change over the sweep)
+
+    Args:
+        metrics (Custom_Metrics): the metrics object for this step, *before* .reset().
+        save_predictions_dir (str | Path): run-level output folder.
+        strategy (str), policy (str): the intervention combination being swept; they key the
+            subfolder, mirroring the wandb naming, so a multi-combination run cannot
+            overwrite itself.
+        num_intervened (int): number of concepts intervened on at this point of the curve.
+        test_loader (DataLoader, optional): only used to recover the sample ids.
+    """
+    out_dir = Path(save_predictions_dir) / f"{strategy}_{policy}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # float16 keeps a 200-way sweep at ~50MB per run rather than ~200MB; the predictions are
+    # only ever used for argmax / AUROC, so the precision is irrelevant.
+    torch.save(
+        {
+            "y_pred_logits": torch.cat(metrics.y_pred_logits, dim=0).cpu().half(),
+            "c_pred_probs": torch.cat(metrics.c_pred_probs, dim=0).cpu().half(),
+        },
+        out_dir / f"step_{num_intervened:03d}.pt",
+    )
+
+    if num_intervened != 0:
+        return
+
+    torch.save(torch.cat(metrics.y_true, dim=0).cpu(), out_dir / "y_true.pt")
+    torch.save(torch.cat(metrics.c_true, dim=0).cpu(), out_dir / "c_true.pt")
+
+    # Sample ids, where the dataset carries them: the CUB family and Waterbirds keep the CUB
+    # image id on every record, the synthetic datasets have no such id. Absent ids are not an
+    # error - the tensors above are still usable in dataset order.
+    samples = getattr(getattr(test_loader, "dataset", None), "data", None)
+    if samples is None or not all(isinstance(s, dict) and "id" in s for s in samples):
+        return
+    with open(out_dir / "img_ids.txt", "w") as f:
+        f.write("\n".join(str(s["id"]) for s in samples) + "\n")
+
+
+def embed_conditional_moments(interv_mu, interv_cov, c_mask, num_extra=0):
+    """
+    Scatter the conditional moments of the non-intervened dimensions back to full size.
+
+    SCBM_Strategy.compute_intervention returns the mean and covariance of the D - k
+    non-intervened dimensions only, k being the number of intervened concepts in the batch
+    (D = num_concepts, plus num_residuals for a residual model, whose residual dimensions
+    are never intervened on). intervene_scbm / intervene_scbm_residual store them per batch
+    and concatenate over the evaluation set, which only works while k is the same in every
+    batch - not under the random_group policy, where each batch follows its own group
+    order. Returned as (batch, D) / (batch, D, D) tensors in the original dimension order
+    with NaN at the intervened positions, so batches always agree in shape. Relies on the
+    strategy leaving the non-intervened dimensions in ascending original order (it asserts
+    that) and on every row of the batch having the same k (the policies assert that).
+    """
+    batch_size = c_mask.shape[0]
+    keep = c_mask == 0
+    if num_extra:
+        extra = torch.ones(batch_size, num_extra, dtype=torch.bool, device=keep.device)
+        keep = torch.cat([keep, extra], dim=1)
+    full_dim = keep.shape[1]
+    full_mu = torch.full(
+        (batch_size, full_dim), float("nan"), dtype=interv_mu.dtype, device=interv_mu.device
+    )
+    full_mu[keep] = interv_mu.reshape(-1)
+    full_cov = torch.full(
+        (batch_size, full_dim, full_dim), float("nan"), dtype=interv_cov.dtype, device=interv_cov.device
+    )
+    full_cov[keep.unsqueeze(2) & keep.unsqueeze(1)] = interv_cov.reshape(-1)
+    return full_mu, full_cov
+
+
+def intervene_scbm(
+    train_loader, test_loader, model, metrics, epoch, config, loss_fn, device, log_file=None,
+    save_predictions_dir=None,
+):
+    """
+    Compute the efficacy of intervening on a model using different intervention strategies and policies for SCBMs.
+
+    This function evaluates the efficacy of intervening on a model using various intervention strategies and policies.
+    It performs interventions on the model's predicted concepts and computes the change in performance after intervention.
+    The function logs the metrics at each step of the intervention process into wandb.
+    Note that multiple comma-separated strategies and policies can be passed in the config file, and the function will
+    iterate over all combinations.
+
+    Args:
+        train_loader (torch.utils.data.DataLoader): DataLoader for the training data. Used for computing empirical percentiles.
+        test_loader (torch.utils.data.DataLoader): DataLoader for the test data.
+        model (torch.nn.Module): The model to be evaluated.
+        metrics (object): An object to track and compute metrics.
+        epoch (int): The current epoch number.
+        config (dict): Configuration dictionary containing model and data settings.
+        loss_fn (callable): The loss function used to compute losses.
+        device (torch.device): The device to run the computations on.
+
+    Returns:
+        None
+    """
+    model.eval()
+    # I changed, change later
+    #policies = config.model.inter_policy.split(",")
+    #strategies = config.model.inter_strategy.split(",")
+    
+
+    policies = get_intervention_policies(config)
+    strategies = [config.model.inter_strategy] # ["conf_interval_optimal"]
+    print(f"Intervention strategy: {strategies}, policy: {policies}")
+    with open(log_file, "a") as f:
+        f.write(f"Intervention strategy: {strategies}, policy: {policies}\n")
+    
+    
+    # I changed from min(config.data.num_concepts, 200)
+
+    # Intervening with different strategies
+    first_intervention = True
+    for strategy in strategies:
+
+        # Intervening with different policies
+        for policy in policies:
+            intervention_dataset_base = []
+            intervention_dataset_fixed = []
+            # Resolved outside the try below: a dataset without a concept grouping should
+            # fail loudly for random_group, not be swallowed as "not implemented for model".
+            intervention_policy = define_policy(policy, config)
+            num_interventions, unit, step_key = intervention_schedule(intervention_policy, config)
+            try:
+                intervention_strategy = define_strategy(
+                    strategy,
+                    train_loader,
+                    model,
+                    device,
+                    config,
+                    propagate_to_residual=propagates_to_residual(config),
+                )
+            except:
+                print(
+                    f"Intervention strategy {strategy} with policy {policy} not implemented for model {config.model.model}."
+                )
+                continue
+
+            ## One full model pass without interventions to set up the dataset required at each intervention step
+            with torch.no_grad():
+
+                for k, batch in enumerate(test_loader):
+                    batch_features, target_true = batch["features"].to(device), batch[
+                        "labels"
+                    ].to(device)
+                    concepts_true = batch["concepts"].to(device)
+                    (
+                        concepts_mcmc_probs,
+                        mu,
+                        triang_cov,
+                        target_pred_logits,
+                    ) = model(batch_features, epoch, validation=True, return_full=True)
+
+                    target_loss, concepts_loss, prec_loss, total_loss = loss_fn(
+                        concepts_mcmc_probs,
+                        concepts_true,
+                        target_pred_logits,
+                        target_true,
+                        triang_cov,
+                    )
+
+                    # Store predictions
+                    concepts_pred_probs = concepts_mcmc_probs.mean(-1)
+                    # I changed
+                    if device.type == "mps":  # MPS backend has issues with double precision
+                        triang_cov = triang_cov.to(torch.float32)
+                        c_mu = mu.to(torch.float32)
+                    else:
+                        triang_cov = triang_cov.to(torch.float64)
+                        c_mu = mu.to(torch.float64)
+                    c_cov = torch.matmul(
+                        triang_cov,
+                        torch.transpose(triang_cov, dim0=1, dim1=2),
+                    )
+                    c_cov = numerical_stability_check(c_cov, device=device)
+                    c_cov_norm = torch.norm(c_cov) / (c_cov.numel() ** 0.5)
+
+                    metrics.update(
+                        target_loss,
+                        concepts_loss,
+                        total_loss,
+                        target_true,
+                        target_pred_logits,
+                        concepts_true,
+                        concepts_pred_probs,
+                        cov_norm=c_cov_norm,
+                        prec_loss=prec_loss,
+                    )
+
+                    (
+                        _,
+                        _,
+                        c_mcmc_probs,
+                        _,
+                    ) = intervention_strategy.compute_intervention(
+                        c_mu,
+                        c_cov,
+                        concepts_true,
+                        torch.zeros_like(concepts_true, device=concepts_true.device),
+                    )
+                    concepts_pred_probs = c_mcmc_probs.mean(-1)
+
+                    intervention_dataset_base.append(
+                        [
+                            c_mu.cpu(),
+                            c_cov.cpu(),
+                            concepts_pred_probs.cpu(),
+                        ]
+                    )
+                    intervention_dataset_fixed.append(
+                        [
+                            c_mu.cpu(),
+                            c_cov.cpu(),
+                            concepts_true.cpu(),
+                            target_true.cpu(),
+                        ]
+                    )
+
+            # Calculate and log metrics
+            metrics_dict = metrics.compute(validation=True, config=config)
+
+            # define which metrics will be plotted against it
+            if first_intervention:
+                # define our custom x axis metric for wandb
+                wandb.define_metric(step_key)
+                first_intervention = False
+            for i, (k, v) in enumerate(metrics_dict.items()):
+                wandb.define_metric(
+                    f"intervention_{strategy}_{policy}/{k}",
+                    step_metric=step_key,
+                )
+                wandb.log(
+                    {
+                        f"intervention_{strategy}_{policy}/{k}": v,
+                        step_key: 0,
+                    }
+                )
+            prints = format_intervention_step(0, unit)
+            for key, value in metrics_dict.items():
+                prints += f"{key}: {value:.3f} "
+            print(prints)
+            print()
+            with open(log_file, "a") as f:
+                f.write(prints + "\n")
+            # for waterbirds dump_intervention_predictions 
+            # so we can analyse minority and majority group performance
+            if save_predictions_dir is not None:
+                dump_intervention_predictions(
+                    metrics,
+                    save_predictions_dir,
+                    strategy,
+                    policy,
+                    0,
+                    test_loader,
+                )
+            metrics.reset()
+
+            ## Computing intervention curves using stored concept predictions
+            # Preparing dataset
+            intervention_dataset_base = [
+                (
+                    torch.cat(
+                        [sublist[i] for sublist in intervention_dataset_base], dim=0
+                    )
+                )
+                for i in range(len(intervention_dataset_base[0]))
+            ]
+            intervention_dataset_fixed = [
+                (
+                    torch.cat(
+                        [sublist[i] for sublist in intervention_dataset_fixed], dim=0
+                    )
+                )
+                for i in range(len(intervention_dataset_fixed[0]))
+            ]
+            # Initializing concepts with 0's
+            intervention_dataset = TensorDataset(
+                *intervention_dataset_base,
+                torch.zeros_like(intervention_dataset_fixed[-2]),
+                *intervention_dataset_fixed,
+            )
+
+            # Performing interventions
+            for num_intervened in range(1, num_interventions + 1):
+                # Update intervened-on concept mask in dataloader
+                updated_intervention_dataset = []
+                intervention_loader = DataLoader(
+                    intervention_dataset,
+                    batch_size=config.model.val_batch_size,
+                    num_workers=config.workers,
+                    shuffle=False,
+                )
+
+                with torch.no_grad():
+                    for k, batch in tqdm(
+                        enumerate(intervention_loader), leave=True, position=0
+                    ):
+                        (
+                            c_mu,
+                            c_cov,
+                            concepts_pred_probs,
+                            concepts_mask,
+                            c_mu_original,
+                            c_cov_original,
+                            concepts_true,
+                            target_true,
+                        ) = [item.to(device) for item in batch]
+
+                        
+                        
+                        
+                        # Determining new concept to intervene on
+                        concepts_mask_new = (
+                            intervention_policy.compute_intervention_mask(
+                                concepts_mask,
+                                concepts_pred_probs=concepts_pred_probs,
+                                mu=c_mu,
+                                cov=c_cov,
+                            )
+                        )
+
+                        # Intervening including new concept
+                        (
+                            c_interv_mu,
+                            c_interv_cov,
+                            c_mcmc_probs,
+                            c_mcmc_logits,
+                        ) = intervention_strategy.compute_intervention(
+                            c_mu_original,
+                            c_cov_original,
+                            concepts_true,
+                            concepts_mask_new,
+                        )
+
+                        target_pred_logits = model.intervene(
+                            c_mcmc_probs, c_mcmc_logits
+                        )
+
+                        target_loss, concepts_loss, prec_loss, total_loss = loss_fn(
+                            c_mcmc_probs,
+                            concepts_true,
+                            target_pred_logits,
+                            target_true,
+                            c_interv_cov,
+                            cov_not_triang=True,
+                        )
+
+                        # Store predictions
+                        concepts_interv_probs = c_mcmc_probs.mean(-1)
+                        c_norm = torch.norm(c_interv_cov) / (
+                            c_interv_cov.numel() ** 0.5
+                        )
+                        metrics.update(
+                            target_loss,
+                            concepts_loss,
+                            total_loss,
+                            target_true,
+                            target_pred_logits,
+                            concepts_true,
+                            concepts_interv_probs,
+                            cov_norm=c_norm,
+                            prec_loss=prec_loss,
+                        )
+
+                        # Full-size, so batches with different numbers of intervened
+                        # concepts (random_group) can be concatenated below.
+                        c_interv_mu_full, c_interv_cov_full = embed_conditional_moments(
+                            c_interv_mu, c_interv_cov, concepts_mask_new
+                        )
+                        updated_intervention_dataset.append(
+                            [
+                                c_interv_mu_full.cpu(),
+                                c_interv_cov_full.cpu(),
+                                concepts_interv_probs.cpu(),
+                                concepts_mask_new.cpu(),
+                            ]
+                        )
+
+                # Calculate and log metrics
+                metrics_dict = metrics.compute(validation=True, config=config)
+                # define which metrics will be plotted against it
+                for i, (k, v) in enumerate(metrics_dict.items()):
+                    wandb.log(
+                        {
+                            f"intervention_{strategy}_{policy}/{k}": v,
+                            step_key: num_intervened,
+                        }
+                    )
+                prints = format_intervention_step(
+                    num_intervened, unit, torch.cat([item[3] for item in updated_intervention_dataset], dim=0)
+                )
+                for key, value in metrics_dict.items():
+                    prints += f"{key}: {value:.3f} "
+                print(prints)
+                print()
+                
+                with open(log_file, "a") as f:
+                    f.write(prints + "\n")
+                
+                # for waterbirds dump_intervention_predictions 
+                # so we can analyse minority and majority group performance
+                if save_predictions_dir is not None:
+                    dump_intervention_predictions(
+                        metrics,
+                        save_predictions_dir,
+                        strategy,
+                        policy,
+                        num_intervened,
+                        test_loader,
+                    )
+                metrics.reset()
+                # Updating dataset
+                intervention_dataset = TensorDataset(
+                    *[
+                        (
+                            torch.cat(
+                                [
+                                    sublist[i]
+                                    for sublist in updated_intervention_dataset
+                                ],
+                                dim=0,
+                            )
+                        )
+                        for i in range(len(updated_intervention_dataset[0]))
+                    ],
+                    *intervention_dataset_fixed,
+                )
+    return
+
+
+
+
+
+
+
+
+
+def intervene_scbm_residual(
+    train_loader, test_loader, model, metrics, epoch, config, loss_fn, device, log_file=None,
+    save_predictions_dir=None,
+):
+    """
+    Compute the efficacy of intervening on a model using different intervention strategies and policies for SCBMs.
+
+    This function evaluates the efficacy of intervening on a model using various intervention strategies and policies.
+    It performs interventions on the model's predicted concepts and computes the change in performance after intervention.
+    The function logs the metrics at each step of the intervention process into wandb.
+    Note that multiple comma-separated strategies and policies can be passed in the config file, and the function will
+    iterate over all combinations.
+
+    Args:
+        train_loader (torch.utils.data.DataLoader): DataLoader for the training data. Used for computing empirical percentiles.
+        test_loader (torch.utils.data.DataLoader): DataLoader for the test data.
+        model (torch.nn.Module): The model to be evaluated.
+        metrics (object): An object to track and compute metrics.
+        epoch (int): The current epoch number.
+        config (dict): Configuration dictionary containing model and data settings.
+        loss_fn (callable): The loss function used to compute losses.
+        device (torch.device): The device to run the computations on.
+
+    Returns:
+        None
+    """
+    model.eval()
+    # I changed, change later
+    #policies = config.model.inter_policy.split(",")
+    #strategies = config.model.inter_strategy.split(",")
+    
+    policies = get_intervention_policies(config)
+    #strategies = ["conf_interval_optimal"]
+    strategies = ["emp_perc"]
+    
+    
+    # I changed from min(config.data.num_concepts, 200)
+
+    # Intervening with different strategies
+    first_intervention = True
+    for strategy in strategies:
+
+        # Intervening with different policies
+        for policy in policies:
+            intervention_dataset_base = []
+            intervention_dataset_fixed = []
+            # Resolved outside the try below: a dataset without a concept grouping should
+            # fail loudly for random_group, not be swallowed as "not implemented for model".
+            intervention_policy = define_policy(policy, config)
+            num_interventions, unit, step_key = intervention_schedule(intervention_policy, config)
+            try:
+                intervention_strategy = define_strategy(
+                    strategy,
+                    train_loader,
+                    model,
+                    device,
+                    config,
+                    propagate_to_residual=propagates_to_residual(config),
+                )
+            except:
+                print(
+                    f"Intervention strategy {strategy} with policy {policy} not implemented for model {config.model.model}."
+                )
+                continue
+
+            ## One full model pass without interventions to set up the dataset required at each intervention step
+            with torch.no_grad():
+
+                for k, batch in enumerate(test_loader):
+                    batch_features, target_true = batch["features"].to(device), batch[
+                        "labels"
+                    ].to(device)
+                    concepts_true = batch["concepts"].to(device)
+                    (
+                        concepts_res_mcmc_probs,
+                        mu,
+                        triang_cov,
+                        target_pred_logits,
+                    ) = model(batch_features, epoch, validation=True, return_full=True)
+
+                    # This is wrong, change this!!!!
+                    concepts_mcmc_probs = concepts_res_mcmc_probs[:, : config.data.num_concepts, :] # [batch_size, num_concepts, monte_carlo_samples]
+
+
+                    target_loss, concepts_loss, prec_loss, total_loss = loss_fn(
+                        concepts_mcmc_probs,
+                        concepts_true,
+                        target_pred_logits,
+                        target_true,
+                        triang_cov,
+                    )
+
+                    # Store predictions
+                    concepts_residuals_pred_probs = concepts_res_mcmc_probs.mean(-1)
+                    # I changed
+                    if device.type == "mps":  # MPS backend has issues with double precision
+                        triang_cov = triang_cov.to(torch.float32)
+                        c_res_mu = mu.to(torch.float32)
+                    else:
+                        triang_cov = triang_cov.to(torch.float64)
+                        c_res_mu = mu.to(torch.float64)
+                        
+                    c_res_cov = torch.matmul(
+                    triang_cov,
+                    torch.transpose(triang_cov, dim0=1, dim1=2),
+                    )
+                    c_res_cov = numerical_stability_check(c_res_cov, device=device)
+                    c_res_cov_norm = torch.norm(c_res_cov) / (c_res_cov.numel() ** 0.5)
+                    
+                    
+                    # Only need concepts for updating metrics
+                    concepts_pred_probs = concepts_residuals_pred_probs[:, : config.data.num_concepts]
+                    
+                    metrics.update(
+                        target_loss,
+                        concepts_loss,
+                        total_loss,
+                        target_true,
+                        target_pred_logits,
+                        concepts_true,
+                        concepts_pred_probs,
+                        cov_norm=c_res_cov_norm,
+                        prec_loss=prec_loss,
+                    )
+                    
+
+                    (
+                        _,
+                        _,
+                        c_res_mcmc_probs,
+                        _,
+                    ) = intervention_strategy.compute_intervention(
+                        c_res_mu,
+                        c_res_cov,
+                        concepts_true,
+                        torch.zeros_like(concepts_true, device=concepts_true.device),
+                    )
+                    concepts_residuals_pred_probs = c_res_mcmc_probs.mean(-1)
+
+                    
+                    
+                    intervention_dataset_base.append(
+                        [
+                            c_res_mu.cpu(),
+                            c_res_cov.cpu(),
+                            concepts_residuals_pred_probs.cpu(),
+                        ]
+                    )
+                    intervention_dataset_fixed.append(
+                        [
+                            c_res_mu.cpu(),
+                            c_res_cov.cpu(),
+                            concepts_true.cpu(),
+                            target_true.cpu(),
+                        ]
+                    )
+
+            # Calculate and log metrics
+            metrics_dict = metrics.compute(validation=True, config=config)
+
+            # define which metrics will be plotted against it
+            if first_intervention:
+                # define our custom x axis metric for wandb
+                wandb.define_metric(step_key)
+                first_intervention = False
+            for i, (k, v) in enumerate(metrics_dict.items()):
+                wandb.define_metric(
+                    f"intervention_{strategy}_{policy}/{k}",
+                    step_metric=step_key,
+                )
+                wandb.log(
+                    {
+                        f"intervention_{strategy}_{policy}/{k}": v,
+                        step_key: 0,
+                    }
+                )
+            prints = format_intervention_step(0, unit)
+            for key, value in metrics_dict.items():
+                prints += f"{key}: {value:.3f} "
+            print(prints)
+            print()
+            with open(log_file, "a") as f:
+                f.write(prints + "\n")
+            # for waterbirds dump_intervention_predictions 
+            # so we can analyse minority and majority group performance
+            if save_predictions_dir is not None:
+                dump_intervention_predictions(
+                    metrics,
+                    save_predictions_dir,
+                    strategy,
+                    policy,
+                    0,
+                    test_loader,
+                )
+            metrics.reset()
+
+            ## Computing intervention curves using stored concept predictions
+            # Concatenates the batches together to create the full dataset for interventions
+            # Preparing dataset
+            intervention_dataset_base = [
+                (
+                    torch.cat(
+                        [sublist[i] for sublist in intervention_dataset_base], dim=0
+                    )
+                )
+                for i in range(len(intervention_dataset_base[0]))
+            ]
+            intervention_dataset_fixed = [
+                (
+                    torch.cat(
+                        [sublist[i] for sublist in intervention_dataset_fixed], dim=0
+                    )
+                )
+                for i in range(len(intervention_dataset_fixed[0]))
+            ]
+            
+
+            
+            # Initializing concepts with 0's
+            # intervention_dataset_fixed[-2] = concepts_true
+            intervention_dataset = TensorDataset(
+                *intervention_dataset_base,
+                torch.zeros_like(intervention_dataset_fixed[-2]), 
+                *intervention_dataset_fixed,
+            )
+
+            # Performing interventions
+            for num_intervened in range(1, num_interventions + 1):
+                # Update intervened-on concept mask in dataloader
+                updated_intervention_dataset = []
+                intervention_loader = DataLoader(
+                    intervention_dataset,
+                    batch_size=config.model.val_batch_size,
+                    num_workers=config.workers,
+                    shuffle=False,
+                )
+
+                with torch.no_grad():
+                    for k, batch in tqdm(
+                        enumerate(intervention_loader), leave=True, position=0
+                    ):
+                        (
+                            c_res_mu,
+                            c_res_cov,
+                            concepts_residuals_pred_probs,
+                            concepts_mask,
+                            c_res_mu_original,
+                            c_res_cov_original,
+                            concepts_true,
+                            target_true,
+                        ) = [item.to(device) for item in batch]
+                        # if k==0:
+                        #     print(f"num_intervened: {num_intervened}, concepts_mask.shape: {concepts_mask.shape}")
+                        
+                        # Determining new concept to intervene on
+                        concepts_mask_new = (
+                            intervention_policy.compute_intervention_mask(
+                                concepts_mask,
+                                num_concepts=config.data.num_concepts,
+                                residual_model=True,
+                                concepts_pred_probs=concepts_pred_probs,
+                                mu=c_res_mu, # not used
+                                cov=c_res_cov, #not used
+                            )
+                        )
+                        
+                        # if k==0:
+                        #     print(f"concepts_mask_new.shape: {concepts_mask_new.shape}")
+
+                        # Intervening including new concept
+                        (
+                            c_res_interv_mu,
+                            c_res_interv_cov,
+                            c_res_mcmc_probs,
+                            c_res_mcmc_logits,
+                        ) = intervention_strategy.compute_intervention(
+                            c_res_mu_original,
+                            c_res_cov_original,
+                            concepts_true,
+                            concepts_mask_new,
+                        )
+
+                        target_pred_logits = model.intervene(
+                            c_res_mcmc_probs, c_res_mcmc_logits
+                        )
+
+                        c_mcmc_probs = c_res_mcmc_probs[:, : config.data.num_concepts, :]
+
+
+                        target_loss, concepts_loss, prec_loss, total_loss = loss_fn(
+                            c_mcmc_probs,
+                            concepts_true,
+                            target_pred_logits,
+                            target_true,
+                            c_res_interv_cov,
+                            cov_not_triang=True,
+                        )
+
+                        # Store predictions
+                        # Unsure about this!!! change 
+                        concepts_residuals_interv_probs = c_res_mcmc_probs.mean(-1)
+                        concepts_interv_probs = concepts_residuals_interv_probs[:, : config.data.num_concepts]
+                        c_norm = torch.norm(c_res_interv_cov) / (
+                            c_res_interv_cov.numel() ** 0.5
+                        )
+                        metrics.update(
+                            target_loss,
+                            concepts_loss,
+                            total_loss,
+                            target_true,
+                            target_pred_logits,
+                            concepts_true,
+                            concepts_interv_probs,
+                            cov_norm=c_norm,
+                            prec_loss=prec_loss,
+                        )
+
+                        # Full-size, so batches with different numbers of intervened
+                        # concepts (random_group) can be concatenated below.
+                        c_res_interv_mu_full, c_res_interv_cov_full = embed_conditional_moments(
+                            c_res_interv_mu, c_res_interv_cov, concepts_mask_new,
+                            num_extra=config.data.num_residuals,
+                        )
+                        updated_intervention_dataset.append(
+                            [
+                                c_res_interv_mu_full.cpu(),
+                                c_res_interv_cov_full.cpu(),
+                                concepts_residuals_interv_probs.cpu(),
+                                concepts_mask_new.cpu(),
+                            ]
+                        )
+
+                # Calculate and log metrics
+                metrics_dict = metrics.compute(validation=True, config=config)
+                # define which metrics will be plotted against it
+                for i, (k, v) in enumerate(metrics_dict.items()):
+                    wandb.log(
+                        {
+                            f"intervention_{strategy}_{policy}/{k}": v,
+                            step_key: num_intervened,
+                        }
+                    )
+                prints = format_intervention_step(
+                    num_intervened, unit, torch.cat([item[3] for item in updated_intervention_dataset], dim=0)
+                )
+                for key, value in metrics_dict.items():
+                    prints += f"{key}: {value:.3f} "
+                print(prints)
+                print()
+                
+                with open(log_file, "a") as f:
+                    f.write(prints + "\n")
+                
+                
+                # for waterbirds dump_intervention_predictions 
+                # so we can analyse minority and majority group performance
+                if save_predictions_dir is not None:
+                    dump_intervention_predictions(
+                        metrics,
+                        save_predictions_dir,
+                        strategy,
+                        policy,
+                        num_intervened,
+                        test_loader,
+                    )
+                metrics.reset()
+                # Updating dataset
+                intervention_dataset = TensorDataset(
+                    *[
+                        (
+                            torch.cat(
+                                [
+                                    sublist[i]
+                                    for sublist in updated_intervention_dataset
+                                ],
+                                dim=0,
+                            )
+                        )
+                        for i in range(len(updated_intervention_dataset[0]))
+                    ],
+                    *intervention_dataset_fixed,
+                )
+    return
+
+
+
+
+
+
+
+
+
+# Do not store the covariance matrices for the full test set. 
+def intervene_scbm_residual_optimized(
+    train_loader, test_loader, model, metrics, epoch, config, loss_fn, device, log_file=None,
+    save_predictions_dir=None,
+):
+    """
+    Memory-optimized intervention evaluation for SCBM residual models.
+
+    Main memory optimization:
+    - Store original c_res_mu and c_res_cov only once.
+    - Between intervention steps, only update the concept intervention mask.
+    - Avoid storing full intervened covariance matrices across the whole dataset.
+    """
+
+    model.eval()
+
+    # I changed, change later
+    # policies = config.model.inter_policy.split(",")
+    # strategies = config.model.inter_strategy.split(",")
+
+    policies = get_intervention_policies(config)
+    strategies = [config.model.inter_strategy]
+    print(f"Intervention strategy: {strategies}, policy: {policies}")
+    with open(log_file, "a") as f:
+        f.write(f"Intervention strategy: {strategies}, policy: {policies}\n")
+
+    # With propagation off the residual is not resampled at any step: the Monte Carlo draws of
+    # the zero-intervention pass below are kept and handed to the head unchanged for the whole
+    # curve, so the only thing that moves along the x-axis is the concept channel.
+    propagate_residual = propagates_to_residual(config)
+    num_concepts = config.data.num_concepts
+
+    first_intervention = True
+
+    for strategy in strategies:
+        for policy in policies:
+
+            # Stores:
+            # [original c_res_mu, original c_res_cov, concepts_pred_probs,
+            #  concepts_true, target_true, concepts_mask]
+            intervention_storage = []
+
+            # Resolved outside the try below: a dataset without a concept grouping should
+            # fail loudly for random_group, not be swallowed as "not implemented for model".
+            intervention_policy = define_policy(policy, config)
+            num_interventions, unit, step_key = intervention_schedule(intervention_policy, config)
+            try:
+                intervention_strategy = define_strategy(
+                    strategy,
+                    train_loader,
+                    model,
+                    device,
+                    config,
+                    propagate_to_residual=propagates_to_residual(config),
+                )
+            except:
+                print(
+                    f"Intervention strategy {strategy} with policy {policy} not implemented for model {config.model.model}."
+                )
+                continue
+
+            # ------------------------------------------------------------
+            # First pass: evaluate zero-intervention performance and store
+            # original mean/covariance only once.
+            # ------------------------------------------------------------
+            with torch.no_grad():
+                for k, batch in enumerate(test_loader):
+                    batch_features = batch["features"].to(device)
+                    target_true = batch["labels"].to(device)
+                    concepts_true = batch["concepts"].to(device)
+
+                    if propagate_residual:
+                        (
+                            concepts_res_mcmc_probs,
+                            mu,
+                            triang_cov,
+                            target_pred_logits,
+                        ) = model(
+                            batch_features,
+                            epoch,
+                            validation=True,
+                            return_full=True,
+                        )
+                        frozen_res_logits = frozen_res_hard = None
+                    else:
+                        # Same forward pass, but this return signature also hands back the Monte
+                        # Carlo samples it fed to the head: c_res_mcmc_logits are the Gaussian
+                        # draws, c_res_mcmc their Bernoulli realisation. The residual block of
+                        # both is what every later step reuses.
+                        (
+                            concepts_res_mcmc_probs,
+                            c_res_mcmc,
+                            c_res_mcmc_logits,
+                            triang_cov,
+                            target_pred_logits,
+                            mu,
+                        ) = model(
+                            batch_features,
+                            epoch,
+                            validation=True,
+                            return_L_int_extension=True,
+                        )
+                        # half / bool rather than float32: this is the only tensor the loop
+                        # stores per Monte Carlo sample, and the draws are a sigmoid argument and
+                        # a bit respectively, so neither needs more precision than that.
+                        frozen_res_logits = (
+                            c_res_mcmc_logits[:, num_concepts:, :].detach().cpu().half()
+                        )
+                        frozen_res_hard = (
+                            c_res_mcmc[:, num_concepts:, :].detach().cpu().bool()
+                        )
+                        del c_res_mcmc, c_res_mcmc_logits
+
+                    C = config.data.num_concepts
+
+                    # Only concept probabilities are needed for concept loss/metrics
+                    concepts_mcmc_probs = concepts_res_mcmc_probs[:, :C, :]
+
+                    target_loss, concepts_loss, prec_loss, sparsity_loss, total_loss = loss_fn(
+                        concepts_mcmc_probs,
+                        concepts_true,
+                        target_pred_logits,
+                        target_true,
+                        triang_cov,
+                    )
+
+                    # Keep your original precision logic
+                    if device.type == "mps":  # MPS backend has issues with double precision
+                        triang_cov = triang_cov.to(torch.float32)
+                        c_res_mu = mu.to(torch.float32)
+                    else:
+                        triang_cov = triang_cov.to(torch.float64)
+                        c_res_mu = mu.to(torch.float64)
+
+                    c_res_cov = torch.matmul(
+                        triang_cov,
+                        torch.transpose(triang_cov, dim0=1, dim1=2),
+                    )
+                    c_res_cov = numerical_stability_check(c_res_cov, device=device)
+
+                    c_res_cov_norm = torch.norm(c_res_cov) / (c_res_cov.numel() ** 0.5)
+
+                    # Concept predictions for metrics and intervention policy
+                    concepts_residuals_pred_probs = concepts_res_mcmc_probs.mean(-1)
+                    concepts_pred_probs = concepts_residuals_pred_probs[:, :C]
+
+                    metrics.update(
+                        target_loss,
+                        concepts_loss,
+                        total_loss,
+                        target_true,
+                        target_pred_logits,
+                        concepts_true,
+                        concepts_pred_probs,
+                        cov_norm=c_res_cov_norm,
+                        prec_loss=prec_loss,
+                    )
+
+                    concepts_mask = torch.zeros_like(concepts_true)
+
+                    # Store original tensors only once.
+                    # Important: c_res_cov is no longer duplicated.
+                    # The mask stays last: the intervention loop replaces it in place by index.
+                    stored = [
+                        c_res_mu.detach().cpu(),
+                        c_res_cov.detach().cpu(),
+                        concepts_pred_probs.detach().cpu(),
+                        concepts_true.detach().cpu(),
+                        target_true.detach().cpu(),
+                    ]
+                    if not propagate_residual:
+                        stored += [frozen_res_logits, frozen_res_hard]
+                    stored.append(concepts_mask.detach().cpu())
+                    intervention_storage.append(stored)
+
+                    del (
+                        concepts_res_mcmc_probs,
+                        mu,
+                        triang_cov,
+                        target_pred_logits,
+                        concepts_mcmc_probs,
+                        c_res_mu,
+                        c_res_cov,
+                        concepts_residuals_pred_probs,
+                        concepts_pred_probs,
+                    )
+
+            # ------------------------------------------------------------
+            # Log zero-intervention metrics
+            # ------------------------------------------------------------
+            metrics_dict = metrics.compute(validation=True, config=config)
+
+            if first_intervention:
+                wandb.define_metric(step_key)
+                first_intervention = False
+
+            for i, (k, v) in enumerate(metrics_dict.items()):
+                wandb.define_metric(
+                    f"intervention_{strategy}_{policy}/{k}",
+                    step_metric=step_key,
+                )
+                wandb.log(
+                    {
+                        f"intervention_{strategy}_{policy}/{k}": v,
+                        step_key: 0,
+                    }
+                )
+
+            prints = format_intervention_step(0, unit)
+            for key, value in metrics_dict.items():
+                prints += f"{key}: {value:.3f} "
+            print(prints)
+            print()
+
+            if log_file is not None:
+                with open(log_file, "a") as f:
+                    f.write(prints + "\n")
+
+            # for waterbirds dump_intervention_predictions 
+            # so we can analyse minority and majority group performance
+            if save_predictions_dir is not None:
+                dump_intervention_predictions(
+                    metrics,
+                    save_predictions_dir,
+                    strategy,
+                    policy,
+                    0,
+                    test_loader,
+                )
+            metrics.reset()
+
+            # ------------------------------------------------------------
+            # Concatenate stored original tensors once.
+            # ------------------------------------------------------------
+            intervention_storage = [
+                torch.cat(
+                    [sublist[i] for sublist in intervention_storage],
+                    dim=0,
+                )
+                for i in range(len(intervention_storage[0]))
+            ]
+
+            # Dataset contains:
+            # original c_res_mu,
+            # original c_res_cov,
+            # concepts_pred_probs,
+            # concepts_true,
+            # target_true,
+            # current concepts_mask
+            intervention_dataset = TensorDataset(*intervention_storage)
+
+            # ------------------------------------------------------------
+            # Intervention loop.
+            # Only update concepts_mask between steps.
+            # ------------------------------------------------------------
+            for num_intervened in range(1, num_interventions + 1):
+
+                updated_masks = []
+
+                intervention_loader = DataLoader(
+                    intervention_dataset,
+                    batch_size=config.model.val_batch_size,
+                    num_workers=config.workers,
+                    shuffle=False,
+                )
+
+                with torch.no_grad():
+                    for k, batch in tqdm(
+                        enumerate(intervention_loader),
+                        leave=True,
+                        position=0,
+                    ):
+                        items = [item.to(device) for item in batch]
+                        (
+                            c_res_mu_original,
+                            c_res_cov_original,
+                            concepts_pred_probs,
+                            concepts_true,
+                            target_true,
+                        ) = items[:5]
+                        # The mask is kept last so it can be replaced by index between steps;
+                        # the frozen residual draws, when present, sit between the two.
+                        concepts_mask = items[-1]
+                        frozen_res_logits, frozen_res_hard = (
+                            (items[5], items[6]) if not propagate_residual else (None, None)
+                        )
+
+                        # Kept concepts_pred_probs argument as requested
+                        concepts_mask_new = intervention_policy.compute_intervention_mask(
+                            concepts_mask,
+                            num_concepts=config.data.num_concepts,
+                            residual_model=True,
+                            concepts_pred_probs=concepts_pred_probs,
+                            mu=c_res_mu_original,
+                            cov=c_res_cov_original,
+                        )
+
+                        (
+                            c_res_interv_mu,
+                            c_res_interv_cov,
+                            c_res_mcmc_probs,
+                            c_res_mcmc_logits,
+                        ) = intervention_strategy.compute_intervention(
+                            c_res_mu_original,
+                            c_res_cov_original,
+                            concepts_true,
+                            concepts_mask_new,
+                            frozen_residual_logits=frozen_res_logits,
+                            frozen_residual_hard=frozen_res_hard,
+                        )
+
+                        target_pred_logits = model.intervene(
+                            c_res_mcmc_probs,
+                            c_res_mcmc_logits,
+                        )
+
+                        C = config.data.num_concepts
+                        c_mcmc_probs = c_res_mcmc_probs[:, :C, :]
+
+                        target_loss, concepts_loss, prec_loss, sparsity_loss, total_loss = loss_fn(
+                            c_mcmc_probs,
+                            concepts_true,
+                            target_pred_logits,
+                            target_true,
+                            c_res_interv_cov,
+                            cov_not_triang=True,
+                        )
+
+                        concepts_residuals_interv_probs = c_res_mcmc_probs.mean(-1)
+                        concepts_interv_probs = concepts_residuals_interv_probs[:, :C]
+
+                        c_norm = torch.norm(c_res_interv_cov) / (
+                            c_res_interv_cov.numel() ** 0.5
+                        )
+
+                        metrics.update(
+                            target_loss,
+                            concepts_loss,
+                            total_loss,
+                            target_true,
+                            target_pred_logits,
+                            concepts_true,
+                            concepts_interv_probs,
+                            cov_norm=c_norm,
+                            prec_loss=prec_loss,
+                        )
+
+                        # Store only the updated mask.
+                        # Do not store c_res_interv_mu or c_res_interv_cov.
+                        updated_masks.append(concepts_mask_new.detach().cpu())
+
+                        del (
+                            items,
+                            frozen_res_logits,
+                            frozen_res_hard,
+                            c_res_mu_original,
+                            c_res_cov_original,
+                            concepts_pred_probs,
+                            c_res_interv_mu,
+                            c_res_interv_cov,
+                            c_res_mcmc_probs,
+                            c_res_mcmc_logits,
+                            target_pred_logits,
+                            c_mcmc_probs,
+                            concepts_residuals_interv_probs,
+                            concepts_interv_probs,
+                        )
+
+                # --------------------------------------------------------
+                # Log metrics for this intervention step
+                # --------------------------------------------------------
+                metrics_dict = metrics.compute(validation=True, config=config)
+
+                for i, (k, v) in enumerate(metrics_dict.items()):
+                    wandb.log(
+                        {
+                            f"intervention_{strategy}_{policy}/{k}": v,
+                            step_key: num_intervened,
+                        }
+                    )
+
+                prints = format_intervention_step(
+                    num_intervened, unit, torch.cat(updated_masks, dim=0)
+                )
+                for key, value in metrics_dict.items():
+                    prints += f"{key}: {value:.3f} "
+                print(prints)
+                print()
+
+                if log_file is not None:
+                    with open(log_file, "a") as f:
+                        f.write(prints + "\n")
+
+
+                # for waterbirds dump_intervention_predictions 
+                # so we can analyse minority and majority group performance
+                if save_predictions_dir is not None:
+                    dump_intervention_predictions(
+                        metrics,
+                        save_predictions_dir,
+                        strategy,
+                        policy,
+                        num_intervened,
+                        test_loader,
+                    )
+                metrics.reset()
+
+                # --------------------------------------------------------
+                # Update only the concept mask in the dataset.
+                # Keep original mu/cov/predictions/concepts/targets fixed.
+                # --------------------------------------------------------
+                updated_masks = torch.cat(updated_masks, dim=0)
+
+                intervention_storage[-1] = updated_masks
+                intervention_dataset = TensorDataset(*intervention_storage)
+
+    return
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def intervene_cbm(
+    train_loader, test_loader, model, metrics, epoch, config, loss_fn, device, log_file=None,
+    save_predictions_dir=None,
+):
+    """
+    Compute the efficacy of intervening on a model using different intervention strategies and policies for baselines.
+
+    This function evaluates the efficacy of intervening on a model using various intervention strategies and policies.
+    It performs interventions on the model's predicted concepts and computes the change in performance after intervention.
+    The function logs the metrics at each step of the intervention process into wandb.
+    Note that multiple comma-separated strategies and policies can be passed in the config file, and the function will
+    iterate over all combinations.
+
+    Args:
+        train_loader (torch.utils.data.DataLoader): DataLoader for the training data. Used for computing empirical percentiles.
+        test_loader (torch.utils.data.DataLoader): DataLoader for the test data.
+        model (torch.nn.Module): The model to be evaluated.
+        metrics (object): An object to track and compute metrics.
+        epoch (int): The current epoch number.
+        config (dict): Configuration dictionary containing model and data settings.
+        loss_fn (callable): The loss function used to compute losses.
+        device (torch.device): The device to run the computations on.
+
+    Returns:
+        None
+    """
+
+    
+    
+
+        
+    model.eval()
+
+    policies = get_intervention_policies(config)
+    # The config documents inter_strategy as comma-separated ('simple_perc,emp_perc' is the
+    # CBM default). Hard CBMs never noticed that it was not split, because their strategy
+    # is forced to 'hard' below; a soft CBM handed the joined string to define_strategy.
+    strategies = [s.strip() for s in str(config.model.inter_strategy).split(",") if s.strip()]
+    
+    if config.model.model in ("cbm", "cbm_residual") and config.model.concept_learning in (
+        "hard",
+        "autoregressive",
+        "embedding",
+    ):
+        strategies = ["hard"]
+    
+    
+    print(f"Intervention strategy: {strategies}, policy: {policies}")
+    with open(log_file, "a") as f:
+        f.write(f"Intervention strategy: {strategies}, policy: {policies}\n")
+        
+        
+    # Intervening with different strategies
+    first_intervention = True
+    for strategy in strategies:
+        # Intervening with different policies
+        for policy in policies:
+            intervention_dataset_base = []
+
+            # Resolved outside the try below: a dataset without a concept grouping should
+            # fail loudly for random_group, not be swallowed as "not implemented for model".
+            intervention_policy = define_policy(policy, config)
+            num_interventions, unit, step_key = intervention_schedule(intervention_policy, config)
+            try:
+                intervention_strategy = define_strategy(
+                    strategy, train_loader, model, device, config
+                )
+            except:
+                print(
+                    f"Intervention strategy {strategy} with policy {policy} not implemented for model {config.model.model}."
+                )
+                continue
+
+            # One full model pass without interventions
+            with torch.no_grad():
+
+                for k, batch in tqdm(enumerate(test_loader), leave=True, position=0):
+                    batch_features, target_true = batch["features"].to(device), batch[
+                        "labels"
+                    ].to(device)
+                    concepts_true = batch["concepts"].to(device)
+
+                    (
+                        concepts_pred_probs,
+                        target_pred_logits,
+                        concepts_hard,
+                    ) = model(batch_features, epoch, validation=True)
+                    if config.model.concept_learning == "autoregressive":
+                        concepts_pred_probs_m = torch.mean(
+                            concepts_pred_probs, dim=-1
+                        )  # Calculating the metrics on the average probabilities from MCMC
+                    else:
+                        concepts_pred_probs_m = concepts_pred_probs
+
+                    target_loss, concepts_loss, total_loss = loss_fn(
+                        concepts_pred_probs_m,
+                        concepts_true,
+                        target_pred_logits,
+                        target_true,
+                    )
+
+                    # Store predictions
+                    metrics.update(
+                        target_loss,
+                        concepts_loss,
+                        total_loss,
+                        target_true,
+                        target_pred_logits,
+                        concepts_true,
+                        concepts_pred_probs_m,
+                    )
+                    intervention_dataset_base.append(
+                        [
+                            concepts_pred_probs.cpu(),
+                            concepts_true.cpu(),
+                            target_true.cpu(),
+                            batch_features.cpu(),
+                            concepts_hard.cpu(),
+                            concepts_pred_probs_m.cpu(),
+                        ]
+                    )
+
+            # Calculate and log metrics
+            metrics_dict = metrics.compute(validation=True, config=config)
+
+            # define which metrics will be plotted against it
+            if first_intervention:
+                # define our custom x axis metric for wandb
+                wandb.define_metric(step_key)
+                first_intervention = False
+            for i, (k, v) in enumerate(metrics_dict.items()):
+                wandb.define_metric(
+                    f"intervention_{strategy}_{policy}/{k}",
+                    step_metric=step_key,
+                )
+                wandb.log(
+                    {
+                        f"intervention_{strategy}_{policy}/{k}": v,
+                        step_key: 0,
+                    }
+                )
+            prints = format_intervention_step(0, unit)
+            for key, value in metrics_dict.items():
+                prints += f"{key}: {value:.3f} "
+            print(prints)
+            print()
+            with open(log_file, "a") as f:
+                f.write(prints + "\n")
+            
+            
+            # for waterbirds dump_intervention_predictions 
+            # so we can analyse minority and majority group performance
+            if save_predictions_dir is not None:
+                dump_intervention_predictions(
+                    metrics,
+                    save_predictions_dir,
+                    strategy,
+                    policy,
+                    0,
+                    test_loader,
+                )
+            metrics.reset()
+
+            # Computing intervention curves using stored concept predictions
+            # Preparing dataset
+            intervention_dataset_base = [
+                (
+                    torch.cat(
+                        [sublist[i] for sublist in intervention_dataset_base], dim=0
+                    )
+                )
+                for i in range(len(intervention_dataset_base[0]))
+            ]
+
+            concepts_dataset_mask = torch.zeros_like(intervention_dataset_base[1])
+
+            for num_intervened in range(1, num_interventions + 1):
+                intervention_dataset = TensorDataset(
+                    *intervention_dataset_base, concepts_dataset_mask
+                )
+                intervention_loader = DataLoader(
+                    intervention_dataset,
+                    batch_size=config.model.val_batch_size,
+                    num_workers=config.workers,
+                    shuffle=False,
+                )
+                concepts_dataset_mask_new = []
+
+                with torch.no_grad():
+                    for k, batch in tqdm(
+                        enumerate(intervention_loader), leave=True, position=0
+                    ):
+                        (
+                            concepts_pred_probs,
+                            concepts_true,
+                            target_true,
+                            input_features,
+                            concepts_hard,
+                            concepts_pred_probs_m,
+                            concepts_mask,
+                        ) = [item.to(device) for item in batch]
+
+                        if config.model.concept_learning == "autoregressive":
+                            # Mask based on probabilities from MCMC
+                            concepts_mask_new = (
+                                intervention_policy.compute_intervention_mask(
+                                    concepts_mask,
+                                    concepts_pred_probs=concepts_pred_probs_m,
+                                )
+                            )
+                            # Intervening on AR
+                            concept_probs, concepts_interv_probs = model.intervene_ar(
+                                concepts_true.unsqueeze(-1).expand(
+                                    -1, -1, concepts_hard.shape[-1]
+                                ),
+                                concepts_mask_new.unsqueeze(-1).expand(
+                                    -1, -1, concepts_hard.shape[-1]
+                                ),
+                                input_features,
+                            )
+                            target_pred_logits = model.intervene(
+                                concepts_interv_probs,
+                                concepts_mask_new.unsqueeze(-1).expand(
+                                    -1, -1, concepts_hard.shape[-1]
+                                ),
+                                input_features,
+                                concepts_pred_probs,
+                            )
+                            concepts_interv_probs = torch.mean(
+                                concept_probs, dim=-1
+                            )  # Calculating the metrics on the average probabilities from MCMC
+                        else:
+                            concepts_mask_new = (
+                                intervention_policy.compute_intervention_mask(
+                                    concepts_mask,
+                                    concepts_pred_probs=concepts_pred_probs,
+                                )
+                            )
+                            concepts_interv_probs = (
+                                intervention_strategy.compute_intervention_cbm(
+                                    concepts_pred_probs,
+                                    concepts_true,
+                                    concepts_mask_new,
+                                )
+                            )
+                            target_pred_logits = model.intervene(
+                                concepts_interv_probs,
+                                concepts_mask_new,
+                                input_features,
+                                concepts_pred_probs,
+                            )
+
+                        target_loss, concepts_loss, total_loss = loss_fn(
+                            concepts_interv_probs,
+                            concepts_true,
+                            target_pred_logits,
+                            target_true,
+                        )
+
+                        # Store predictions
+                        metrics.update(
+                            target_loss,
+                            concepts_loss,
+                            total_loss,
+                            target_true,
+                            target_pred_logits,
+                            concepts_true,
+                            concepts_interv_probs,
+                        )
+                        concepts_dataset_mask_new.append(concepts_mask_new)
+
+                # Calculate and log metrics
+                metrics_dict = metrics.compute(validation=True, config=config)
+                # define which metrics will be plotted against it
+                for i, (k, v) in enumerate(metrics_dict.items()):
+                    wandb.log(
+                        {
+                            f"intervention_{strategy}_{policy}/{k}": v,
+                            step_key: num_intervened,
+                        }
+                    )
+                prints = format_intervention_step(
+                    num_intervened, unit, torch.cat(concepts_dataset_mask_new, dim=0)
+                )
+                for key, value in metrics_dict.items():
+                    prints += f"{key}: {value:.3f} "
+                print(prints)
+                print()
+                with open(log_file, "a") as f:
+                    f.write(prints + "\n")
+                
+                
+                
+                # for waterbirds dump_intervention_predictions 
+                # so we can analyse minority and majority group performance
+                if save_predictions_dir is not None:
+                    dump_intervention_predictions(
+                        metrics,
+                        save_predictions_dir,
+                        strategy,
+                        policy,
+                        num_intervened,
+                        test_loader,
+                    )
+                metrics.reset()
+                # Updating mask
+                concepts_dataset_mask = torch.cat(
+                    concepts_dataset_mask_new, dim=0
+                ).cpu()
+    return
+
+
+def get_intervention_policies(config):
+    """
+    The intervention policy of this run, from inference.inter_policy (default "random").
+
+    One policy per run: inference.py names the intervention log after the policy, and the
+    analysis notebooks key a log by step, so two curves in one file would be unreadable.
+    """
+    inference_cfg = config.get("inference", None)
+    policy = "random" if inference_cfg is None else inference_cfg.get("inter_policy", "random")
+    policy = str(policy).strip()
+    if "," in policy:
+        raise ValueError(
+            f"inference.inter_policy takes a single policy per run, got {policy!r}. "
+            "Run inference.py once per policy; each writes its own intervention log."
+        )
+    return [policy]
+
+
+def intervention_schedule(intervention_policy, config):
+    """
+    Number of steps on the curve, what one step adds ("concepts" or "groups"), and the
+    wandb key of the x-axis. Concept-wise policies add one concept per step, capped by
+    model.max_interventions; the group policy adds one whole group per step.
+    """
+    if isinstance(intervention_policy, RandomGroupInterventionPolicy):
+        num_steps = min(intervention_policy.num_groups, config.model.max_interventions)
+        unit = "groups"
+    else:
+        num_steps = min(config.data.num_concepts, config.model.max_interventions)
+        unit = "concepts"
+    return num_steps, unit, f"intervention/num_{unit}_intervened"
+
+
+def format_intervention_step(num_intervened, unit, masks=None):
+    """
+    Prefix of a logged curve point.
+
+    "Intervention on <n> concepts: " is unchanged for the concept-wise policies - the analysis
+    notebooks parse that exact phrase. A group step additionally reports the mean number of
+    concepts it amounts to (groups differ in size), so a group curve can also be read on a
+    concept axis.
+    """
+    line = f"Intervention on {num_intervened} {unit}"
+    if unit != "concepts" and masks is not None:
+        line += f" (mean {masks.float().sum(1).mean().item():.1f} concepts)"
+    return line + ": "
+
+
+def define_policy(policy, config=None):
+    """
+    Return the intervention policy that determines on which concepts to intervene
+
+    Args:
+        policy (str): The name of the intervention policy to use. Supported policies are:
+                      - "random": Randomly selects concepts to intervene on.
+                      - "prob_unc": Selects concepts based on uncertainty as measured by closeness to 0.5.
+                      - "random_group": Randomly selects whole semantic concept groups to intervene on
+                        (CUB family and AwA2; see get_intervention_concept_groups). Needs `config`.
+        config (DictConfig, optional): The run configuration; only needed for "random_group".
+
+    Returns:
+        object: An instance of the selected intervention policy class.
+
+    Example:
+        >>> policy = define_policy("random")
+        USING FOLLOWING POLICY: RandomSubsetInterventionPolicy
+    """
+    if policy == "random":
+        intervention_policy = RandomSubsetInterventionPolicy()
+    elif policy == "prob_unc":
+        intervention_policy = ProbUncertaintyInterventionPolicy()
+    elif policy == "random_group":
+        if config is None:
+            raise ValueError("define_policy('random_group') needs the run config to build the concept groups.")
+        groups = get_intervention_concept_groups(config)
+        intervention_policy = RandomGroupInterventionPolicy(groups, config.data.num_concepts)
+        print(
+            f"Intervening on {len(groups)} concept groups "
+            f"(sizes {[len(idxs) for idxs in groups.values()]}): {list(groups)}"
+        )
+    else:
+        raise NotImplementedError("No such policy as", policy, "defined!")
+
+    print("USING FOLLOWING POLICY:", intervention_policy.__class__.__name__)
+    return intervention_policy
+
+
+class RandomGroupInterventionPolicy:
+    """
+    A policy that intervenes on complete concept groups, one randomly chosen group per step.
+
+    `groups` maps a group name to the concept indices (in the model's own concept space)
+    forming it, e.g. the 28 CUB ATTRIBUTE_PARTS or the 28 CEM AwA2 groups. Each step adds
+    every concept of one more group, so after k steps k whole groups are intervened on and
+    the curve's x-axis counts groups, not concepts.
+
+    The group is drawn per *batch*, not per sample. The SCBM strategies condition the
+    Gaussian on a block whose size they read off the first sample
+    (SCBM_Strategy.compute_intervention, ConfIntervalOptimalStrategy), so every sample in a
+    batch must carry the same number of intervened concepts - which, with groups of
+    different sizes, means the same groups. Batches are fixed across steps (shuffle=False
+    on the stored dataset), so each batch follows its own random group order and the curve
+    averages over as many orders as there are batches. The expected curve is the one a
+    per-sample order would give; only its variance is larger.
+    """
+
+    def __init__(self, groups, num_concepts):
+        if not groups:
+            raise ValueError("RandomGroupInterventionPolicy needs at least one concept group.")
+        self.group_names = list(groups.keys())
+        self.groups = [[int(i) for i in idxs] for idxs in groups.values()]
+        self.num_groups = len(self.groups)
+        # membership[g, c] == 1 iff concept c belongs to group g
+        membership = torch.zeros(self.num_groups, num_concepts)
+        for g, idxs in enumerate(self.groups):
+            membership[g, idxs] = 1.0
+        self.membership = membership
+        self.group_sizes = membership.sum(1)
+
+    def compute_intervention_mask(self, concepts_mask, **kwargs):
+        """
+        Add one not-yet-intervened group, the same for every sample of the batch.
+
+        Args:
+            concepts_mask (torch.Tensor): Which concepts are already intervened on, identical
+                                          across rows. Shape: (batch_size, num_concepts)
+
+        Returns:
+            torch.Tensor: The mask with one more complete group set to 1, updated in place.
+        """
+        if concepts_mask.shape[1] != self.membership.shape[1]:
+            raise ValueError(
+                f"Mask has {concepts_mask.shape[1]} concepts but the groups were built for "
+                f"{self.membership.shape[1]}."
+            )
+        if not torch.all(concepts_mask == concepts_mask[0]):
+            raise ValueError(
+                "random_group intervenes batch-wise, so every sample in a batch must share "
+                "the same intervention history; the rows of concepts_mask differ."
+            )
+        membership = self.membership.to(concepts_mask.device)
+        group_sizes = self.group_sizes.to(concepts_mask.device)
+
+        # A group counts as intervened on once all its concepts are masked (groups are disjoint).
+        done = (concepts_mask[0].float() @ membership.T) >= group_sizes
+        candidates = torch.nonzero(~done).squeeze(1)
+        if candidates.numel() == 0:
+            raise ValueError("Every concept group is already intervened on.")
+        chosen = candidates[torch.randint(candidates.numel(), (1,), device=candidates.device)]
+        concepts_mask[:, membership[chosen].squeeze(0).bool()] = 1
+
+        assert torch.all(concepts_mask.sum(1) == concepts_mask.sum(1)[0])
+        return concepts_mask
+
+
+class RandomSubsetInterventionPolicy:
+    """
+    A policy for randomly selecting concepts to intervene on.
+    """
+    
+ 
+    
+    def compute_intervention_mask(self,concepts_mask, num_concepts=None, residual_model = False, **kwargs):
+        """
+        Generate a mask for intervening on a randomly selected concepts, one at a time.
+
+        Args:
+            concepts_mask (torch.Tensor): A tensor indicating which concepts are already masked (intervened).
+                                          Shape: (batch_size, num_concepts)
+
+        Returns:
+            torch.Tensor: An updated tensor with one additional masked concept.
+                          Shape: (batch_size, num_concepts)
+        """
+
+        num_noninterv_concepts = concepts_mask.shape[1] - concepts_mask.sum(1)[0]
+        num_noninterv_concepts = int(num_noninterv_concepts.item()) # I changed
+            
+            
+        interv_indices = torch.randint(
+            low=0,
+            high=num_noninterv_concepts,
+            size=(concepts_mask.shape[0],),
+            device=concepts_mask.device,
+        )
+
+
+        # Adjust for concepts that are already masked
+        non_masked_indices = torch.where(concepts_mask == 0)[1].reshape(
+            -1, num_noninterv_concepts
+        )
+        interv_indices_adjusted = non_masked_indices[
+            torch.arange(concepts_mask.shape[0]), interv_indices
+        ]
+
+        concepts_mask[torch.arange(concepts_mask.shape[0]), interv_indices_adjusted] = 1
+
+        assert torch.all(concepts_mask.sum(1) == concepts_mask.sum(1)[0])
+        return concepts_mask
+    
+    
+    
+    def compute_intervention_mask_fixed(
+        self,
+        concepts_mask,
+        num_interventions=1,
+        **kwargs,
+    ):
+        """
+        Generate a mask for intervening on a chosen number of randomly selected
+        non-intervened concepts per sample.
+
+        Args:
+            concepts_mask (torch.Tensor):
+                Binary tensor indicating which concepts are already intervened on.
+                Shape: [batch_size, num_concepts]
+
+            num_interventions (int):
+                Number of new random concepts to intervene on per sample.
+
+        Returns:
+            torch.Tensor:
+                Updated concept intervention mask.
+                Shape: [batch_size, num_concepts]
+        """
+
+        batch_size, num_concepts = concepts_mask.shape
+
+        # Assumes every sample currently has the same number of intervened concepts
+        num_noninterv_concepts = num_concepts - concepts_mask.sum(1)[0]
+        num_noninterv_concepts = int(num_noninterv_concepts.item())
+
+        if num_interventions > num_noninterv_concepts:
+            raise ValueError(
+                f"Cannot intervene on {num_interventions} concepts; "
+                f"only {num_noninterv_concepts} non-intervened concepts remain."
+            )
+
+        # Shape: [batch_size, num_noninterv_concepts]
+        # Each row contains the indices of concepts that are not yet intervened on
+        non_masked_indices = torch.where(concepts_mask == 0)[1].reshape(
+            batch_size,
+            num_noninterv_concepts,
+        )
+
+        # Randomly choose num_interventions positions per sample
+        random_scores = torch.rand(
+            batch_size,
+            num_noninterv_concepts,
+            device=concepts_mask.device,
+        )
+
+        selected_positions = torch.argsort(random_scores, dim=1)[:, :num_interventions]
+
+        # Convert selected positions into actual concept indices
+        selected_concept_indices = non_masked_indices[
+            torch.arange(batch_size, device=concepts_mask.device).unsqueeze(1),
+            selected_positions,
+        ]
+
+        # Set selected concepts to intervened
+        concepts_mask[
+            torch.arange(batch_size, device=concepts_mask.device).unsqueeze(1),
+            selected_concept_indices,
+        ] = 1
+
+        assert torch.all(concepts_mask.sum(1) == concepts_mask.sum(1)[0])
+
+        return concepts_mask
+    
+    
+    
+
+  
+
+class ProbUncertaintyInterventionPolicy:
+    """
+    A policy for uncertainty-based selection of concepts to intervene on.
+    """
+
+    def compute_intervention_mask(self, concepts_mask, concepts_pred_probs, **kwargs):
+        """
+        Generate a mask for intervening on selected concepts as determined by highest uncertainty, one at a time.
+
+        Args:
+            concepts_mask (torch.Tensor): A tensor indicating which concepts are already masked (intervened).
+                                          Shape: (batch_size, num_concepts)
+
+        Returns:
+            torch.Tensor: An updated tensor with one additional masked concept.
+                          Shape: (batch_size, num_concepts)
+        """
+        # Intervene on concept with highest uncertainty
+        num_masked = concepts_mask.sum(1)[0]
+        uncs = torch.abs(concepts_pred_probs - 0.5)
+        uncs_ind_sort = torch.sort(uncs, dim=-1)[1]
+
+        # Cumbersome way of adjusting for concepts that are already masked, taking into account that due to MCMC order of concept uncertainties might change from epoch to epoch
+        ind = 0
+        mask_filled = concepts_mask.sum(1) == num_masked + 1
+        while not mask_filled.all():
+            mask_indices = uncs_ind_sort[:, ind]
+            # Only replace samples that don't have num_masked+1 concepts masked
+            concepts_mask[~mask_filled, mask_indices[~mask_filled]] = 1
+            mask_filled = concepts_mask.sum(1) == num_masked + 1
+            ind += 1
+        assert torch.all(concepts_mask.sum(1) == concepts_mask.sum(1)[0])
+        return concepts_mask
+
+
+def propagates_to_residual(config):
+    """
+    Whether a concept intervention is propagated to the residual channel of an SCBM residual
+    model, read from `inference.propagate_to_residual` (default True = standard behaviour).
+
+    True reproduces the joint conditional update: conditioning on the intervened concepts moves
+    every other dimension of the bottleneck, residuals included. False keeps the concept-to-
+    concept propagation that makes an SCBM an SCBM, but does not resample the residual at all -
+    the draws of the zero-intervention pass are reused at every step, so the head is handed the
+    same residual numbers all along the curve. That isolates how much of an intervention curve
+    comes from correcting the residual rather than the concepts.
+
+    It is not a leakage ablation: only the within-x coupling Sigma_rc is removed. What mu_r(x)
+    encodes about concepts across x is untouched.
+
+    Always True for non-residual models, where the option has no meaning.
+    """
+    if config.model.model != "scbm_residual":
+        return True
+    inference_config = config.get("inference", None)
+    if inference_config is None:
+        return True
+    value = inference_config.get("propagate_to_residual", True)
+    return True if value is None else bool(value)
+
+
+def define_strategy(
+    inter_strategy, train_loader, model, device, config, propagate_to_residual=True
+):
+    """
+    Return the intervention strategy that determines how the ground-truth intervened-on concept values are encoded in the model.
+    This function selects and returns the appropriate intervention strategy based on the provided strategy name and model configuration.
+
+    Args:
+        inter_strategy (str): The name of the intervention strategy to use. Supported strategies are:
+                              - "simple_perc": Uses the logits corresponding to 5% and 95%.
+                              - "emp_perc": Uses the logits corresponding to 5th and 95th percentile of training predictions.
+                              - "conf_interval_optimal": Uses a confidence interval-based optimal strategy for SCBMs.
+        train_loader (torch.utils.data.DataLoader): DataLoader to obtain empirical percentiles of training data
+        model (torch.nn.Module): The model to be evaluated.
+        device (torch.device): The device to run the computations on.
+        config (dict): Configuration dictionary containing model and data settings.
+        propagate_to_residual (bool): 'scbm_residual' only, ignored otherwise. If False, a
+                              concept intervention updates the other *concepts* through the
+                              conditional Gaussian as usual, but the residual channel is not
+                              resampled: the zero-intervention pass's draws are reused at every
+                              step (see SCBM_Strategy.compute_intervention).
+
+    Returns:
+        object: An instance of the selected intervention strategy class.
+
+    Raises:
+        NotImplementedError: If the specified strategy is not supported for the given model.
+
+    Example:
+        >>> strategy = define_strategy("simple_perc", train_loader, model, device, config)
+        USING FOLLOWING STRATEGY: PercentileStrategy
+    """
+    if config.model.model in ("cbm", "cbm_residual"):
+        if config.model.concept_learning in ("hard", "autoregressive", "embedding"):
+            inter_strategy = HardCBMStrategy()
+        elif inter_strategy == "simple_perc":
+            inter_strategy = PercentileStrategy()
+        elif inter_strategy == "emp_perc":
+            inter_strategy = EmpiricalPercentileStrategy(
+                train_loader=train_loader, model=model, device=device
+            )
+        else:
+            raise NotImplementedError(
+                f"Intervention strategy '{inter_strategy}' is not implemented for soft "
+                f"CBMs (model {config.model.model}); use 'simple_perc' or 'emp_perc'."
+            )
+        print("USING FOLLOWING STRATEGY:", inter_strategy.__class__.__name__)
+
+    elif config.model.model == "scbm":
+        inter_strategy = SCBM_Strategy(
+            inter_strategy, train_loader, model, device, config
+        )
+        print(
+            "USING FOLLOWING STRATEGY:", inter_strategy.interv_strat.__class__.__name__
+        )
+    
+    elif config.model.model == "scbm_residual":
+        inter_strategy = SCBM_Strategy(
+            inter_strategy,
+            train_loader,
+            model,
+            device,
+            config,
+            propagate_to_residual=propagate_to_residual,
+        )
+        print(
+            "USING FOLLOWING STRATEGY:", inter_strategy.interv_strat.__class__.__name__
+        )
+        if not propagate_to_residual:
+            print(
+                "Interventions are NOT propagated to the residual channel: the residual Monte "
+                "Carlo draws of the zero-intervention pass are reused unchanged at every step."
+            )
+    else:
+        raise NotImplementedError(
+            "No such strategy as",
+            config.model.inter_strategy,
+            "defined for model",
+            config.model.model,
+            "!",
+        )
+
+    return inter_strategy
+
+
+class SCBM_Strategy:
+    """
+    A strategy for intervening on SCBM using the conditional normal distribution.
+
+    This class defines a strategy for intervening on SCBM(Stochastic Concept Bottleneck Model)s.
+    It supports different intervention strategies such as simple percentile, empirical percentile, and confidence interval optimal strategies.
+
+    Args:
+        inter_strategy (str): The name of the intervention strategy to use. Supported strategies are:
+                              - "simple_perc": Uses the logits corresponding to 5% and 95%.
+                              - "emp_perc": Uses the logits corresponding to 5th and 95th percentile of training predictions.
+                              - "conf_interval_optimal": Uses a confidence interval-based optimal strategy for SCBMs.
+        train_loader (torch.utils.data.DataLoader): DataLoader to obtain empirical percentiles of training data
+        model (torch.nn.Module): The model to be evaluated.
+        device (torch.device): The device to run the computations on.
+        config (dict): Configuration dictionary containing model and data settings.
+        propagate_to_residual (bool): Residual models only. True (default) is the standard
+            SCBM behaviour: the conditional Gaussian update given the intervened concepts is
+            applied to *every* non-intervened dimension, residuals included, so an intervention
+            moves the residual channel as well. False keeps the propagation among concepts but
+            does not resample the residual at all: the zero-intervention pass's Monte Carlo
+            residual draws are spliced back in at every step, so the head sees the same residual
+            numbers all along the curve - see compute_intervention.
+    """
+
+    def __init__(
+        self,
+        inter_strategy,
+        train_loader,
+        model,
+        device,
+        config,
+        propagate_to_residual=True,
+    ):
+        self.num_monte_carlo = config.model.num_monte_carlo
+        self.num_concepts = config.data.num_concepts
+        self.act_c = nn.Sigmoid()
+        self.residual = False
+        self.propagate_to_residual = True
+        if config.model.model == "scbm_residual":
+            self.residual = True
+            self.num_residuals = config.data.num_residuals
+            self.propagate_to_residual = propagate_to_residual
+        if inter_strategy == "simple_perc":
+            self.interv_strat = PercentileStrategy()
+        elif inter_strategy == "emp_perc":
+            self.interv_strat = EmpiricalPercentileStrategy(
+                train_loader=train_loader, model=model, device=device, is_scbm=True
+            )
+        elif inter_strategy == "conf_interval_optimal":
+            self.interv_strat = ConfIntervalOptimalStrategy(level=config.model.level)
+        else:
+            raise NotImplementedError(
+                "No such strategy as",
+                config.model.inter_strategy,
+                "defined for model",
+                config.model.model,
+                "!",
+            )
+
+    
+    
+    
+    def compute_intervention(
+        self,
+        c_mu,
+        c_cov,
+        c_true,
+        c_mask,
+        frozen_residual_logits=None,
+        frozen_residual_hard=None,
+    ):
+        """
+        Generate an intervention on an SCBM using the conditional normal distribution.
+
+        First, this function computes the logits of the intervened-on concepts based on the intervention strategy.
+        Then, using the predicted concept mean and covariance, it computes the conditional normal distribution, conditioned on
+        the intervened-on concept logits. To this end, the order is permuted such that the intervened-on concepts form a block at the start.
+        Finally, the method samples from the conditional normal distribution and permutes the results back to the original order.
+
+        For a residual model with propagate_to_residual=False, the conditional update is kept
+        for the non-intervened concepts, but the residual channel is not resampled at all: the
+        Monte Carlo residuals drawn by the zero-intervention pass are spliced back in, the same
+        numbers at every point of the intervention curve. The returned moments are set to match
+        what is sampled - the concept conditional, block-diagonal with the residual's
+        pre-intervention mean and covariance and zero cross-covariance, since the frozen
+        residual draws are independent of the freshly drawn conditional concepts.
+
+        Args:
+            c_mu (torch.Tensor): The predicted mean values of the concepts. Shape: (batch_size, num_concepts)
+            c_cov (torch.Tensor): The predicted covariance matrix of the concepts. Shape: (batch_size, num_concepts, num_concepts)
+            c_true (torch.Tensor): The ground-truth concept values. Shape: (batch_size, num_concepts)
+            c_mask (torch.Tensor): A mask indicating which concepts are intervened-on. Shape: (batch_size, num_concepts)
+
+        Returns:
+            tuple: A tuple containing the intervened-on concept means, covariances, MCMC sampled concept probabilities, and logits.
+                    Note that the probabilities are set to 0/1 for the intervened-on concepts according to the ground-truth.
+
+        Args (continued):
+            frozen_residual_logits, frozen_residual_hard (torch.Tensor, optional): the residual
+                logits and the Bernoulli draw of them that the zero-intervention pass fed to the
+                head, both (batch_size, num_residuals, num_monte_carlo). Required when
+                propagate_to_residual is False, ignored otherwise. The hard draw is spliced in as
+                exact 0./1. probabilities so the torch.bernoulli inside model.intervene
+                reproduces it unchanged - the same trick the intervened concepts already use.
+        """
+        num_intervened = int(c_mask.sum(1)[0].item())
+        device = c_mask.device
+        freeze_residual = self.residual and not self.propagate_to_residual
+        if freeze_residual and (
+            frozen_residual_logits is None or frozen_residual_hard is None
+        ):
+            raise ValueError(
+                "propagate_to_residual=False needs the residual Monte Carlo samples of the "
+                "zero-intervention pass, which only intervene_scbm_residual_optimized collects "
+                "and forwards."
+            )
+
+
+        if self.residual:
+            # expand c_true and c_mask to include residuals (which are not intervened on, so mask is 0 and true is 0)
+            batch_size = c_true.shape[0]
+            zeros_residual = torch.zeros(batch_size, self.num_residuals, device=c_true.device, dtype=c_true.dtype)
+            c_true = torch.cat([c_true, zeros_residual], dim=1)
+            c_mask = torch.cat([c_mask, torch.zeros_like(zeros_residual)], dim=1)
+
+        if num_intervened == 0:
+            # No intervention
+            interv_mu = c_mu
+            interv_cov = c_cov
+            # Sample from normal distribution
+            dist = MultivariateNormal(interv_mu, covariance_matrix=interv_cov)
+            mcmc_logits = dist.rsample([self.num_monte_carlo]).movedim(
+                0, -1
+            )  # [batch_size,bottleneck_size,mcmc_size]
+
+        else:
+            # Compute logits of intervened-on concepts
+            # Check conf_interval_optimal strategy for SCBM, which computes optimal logits based on confidence intervals
+            c_intervened_logits = self.interv_strat.compute_intervened_logits(
+                c_mu, c_cov, c_true, c_mask
+            )
+
+            ## Compute conditional normal distribution sample-wise
+            # Permute covariance s.t. intervened-on concepts are a block at start
+            indices = torch.argsort(c_mask, dim=1, descending=True, stable=True)
+            perm_cov = c_cov.gather(
+                1, indices.unsqueeze(2).expand(-1, -1, c_cov.size(2))
+            )
+            perm_cov = perm_cov.gather(
+                2, indices.unsqueeze(1).expand(-1, c_cov.size(1), -1)
+            )
+            perm_mu = c_mu.gather(1, indices)
+            perm_c_intervened_logits = c_intervened_logits.gather(1, indices)
+
+            # Compute mu and covariance conditioned on intervened-on concepts
+            # Intermediate steps
+            perm_intermediate_cov = torch.matmul(
+                perm_cov[:, num_intervened:, :num_intervened],
+                torch.inverse(perm_cov[:, :num_intervened, :num_intervened]),
+            )
+            perm_intermediate_mu = (
+                perm_c_intervened_logits[:, :num_intervened]
+                - perm_mu[:, :num_intervened]
+            )
+            # Mu and Cov after intervention
+            perm_interv_mu = perm_mu[:, num_intervened:] + torch.matmul(
+                perm_intermediate_cov, perm_intermediate_mu.unsqueeze(-1)
+            ).squeeze(-1)
+            perm_interv_cov = perm_cov[
+                :, num_intervened:, num_intervened:
+            ] - torch.matmul(
+                perm_intermediate_cov, perm_cov[:, :num_intervened, num_intervened:]
+            )
+
+            if freeze_residual:
+                # Keep the propagation among concepts, undo it on the residual channel. The
+                # conditional mean/cov above come from the *joint* Gaussian over (concepts,
+                # residuals), so conditioning on the intervened concepts also moves the residual
+                # dimensions. The residual samples are replaced below by the frozen draws of the
+                # zero-intervention pass, so the moments are rewritten to describe what is
+                # actually sampled: the concept conditional (unchanged - it never depended on
+                # the residual block), block-diagonal with the residual's pre-intervention mean
+                # and covariance. Zero cross-covariance, because the frozen residual draws are
+                # independent of the concepts drawn here. Block-diagonal with two PSD blocks is
+                # PSD, so no stability worry.
+                # Non-intervened dimensions stay in ascending original order (asserted below)
+                # and residuals are never intervened on, so they are the trailing block.
+                num_res = self.num_residuals
+                assert (
+                    c_mask[:, -num_res:] == 0
+                ).all(), "Residual dimensions must never be intervened on."
+                perm_interv_mu = torch.cat(
+                    (perm_interv_mu[:, :-num_res], c_mu[:, -num_res:]), dim=1
+                )
+                perm_interv_cov = perm_interv_cov.clone()
+                perm_interv_cov[:, -num_res:, :-num_res] = 0.0
+                perm_interv_cov[:, :-num_res, -num_res:] = 0.0
+                perm_interv_cov[:, -num_res:, -num_res:] = c_cov[:, -num_res:, -num_res:]
+
+            # Adjust for floating point errors in the covariance computation to keep it symmetric
+            perm_interv_cov = numerical_stability_check(
+                perm_interv_cov, device=device
+            )  # Uncomment if Normal throws an error. Takes some time so maybe code it more smartly
+
+            # Sample from intervened conditional normal
+            perm_dist = MultivariateNormal(
+                perm_interv_mu, covariance_matrix=perm_interv_cov
+            )
+            # Logits on non-intervened concepts and residuals (if residual model) after intervention
+            perm_mcmc_logits = (
+                perm_dist.rsample([self.num_monte_carlo])
+                .movedim(0, -1)
+                .to(torch.float32)
+            )  # [bottleneck_size-num_intervened,mcmc_size]
+
+            # Concat logits of intervened-on concepts
+            perm_mcmc_logits = torch.cat(
+                (
+                    perm_c_intervened_logits[:, :num_intervened]
+                    .unsqueeze(-1)
+                    .repeat(1, 1, self.num_monte_carlo),
+                    perm_mcmc_logits,
+                ),
+                dim=1,
+            )
+
+            # Permute back into original form and store
+            indices_reversed = torch.argsort(indices)
+            mcmc_logits = perm_mcmc_logits.gather(
+                1,
+                indices_reversed.unsqueeze(2).expand(-1, -1, perm_mcmc_logits.size(2)),
+            )
+
+            # Return conditional mu&cov
+            assert (
+                torch.argsort(indices[:, num_intervened:])
+                == torch.arange(len(perm_interv_mu[0][:]), device=device)
+            ).all()  # Check that non-intervened concepts weren't permuted s.t. no permutation of interv_mu is needed
+            interv_mu = perm_interv_mu
+            interv_cov = perm_interv_cov
+
+        assert (
+            (mcmc_logits.isnan()).any()
+            == (interv_mu.isnan()).any()
+            == (interv_cov.isnan()).any()
+            == False
+        )
+        # Compute probabilities and set intervened-on probs to 0/1
+        mcmc_probs = self.act_c(mcmc_logits)
+
+        # Set intervened-on hard concepts to 0/1
+        mcmc_probs = (c_true * c_mask).unsqueeze(2).repeat(
+            1, 1, self.num_monte_carlo
+        ) + mcmc_probs * (1 - c_mask).unsqueeze(2).repeat(1, 1, self.num_monte_carlo)
+
+        if freeze_residual:
+            # Put back the residual draws of the zero-intervention pass, byte for byte, so every
+            # point of the curve hands the head the same residual it saw with no intervention at
+            # all. The hard draw goes in as exact 0./1. probabilities, which makes the
+            # torch.bernoulli inside model.intervene a no-op on those entries (hard concept
+            # learning); the logits are what the head reads in the soft variant.
+            num_concepts = self.num_concepts
+            mcmc_logits = torch.cat(
+                (
+                    mcmc_logits[:, :num_concepts, :],
+                    frozen_residual_logits.to(mcmc_logits.dtype),
+                ),
+                dim=1,
+            )
+            mcmc_probs = torch.cat(
+                (
+                    mcmc_probs[:, :num_concepts, :],
+                    frozen_residual_hard.to(mcmc_probs.dtype),
+                ),
+                dim=1,
+            )
+
+        return interv_mu, interv_cov, mcmc_probs, mcmc_logits
+
+
+class SCBMPercentileStrategy:
+    # Set intervened concept logits to 0.05 & 0.95
+    def __init__(self):
+        pass
+
+    def compute_intervened_logits(self, c_mu, c_cov, c_true, c_mask):
+        # Set intervened concept logits to 0.05 & 0.95 probabilities
+        c_intervened_probs = (0.05 + 0.9 * c_true) * c_mask
+        c_intervened_logits = torch.logit(c_intervened_probs, eps=1e-6)
+        return c_intervened_logits
+
+
+class PercentileStrategy:
+    # Set intervened concepts to 0.05 & 0.95 probabilities
+    def __init__(self):
+        pass
+
+    def _compute_intervened_probs(self, c_true, c_mask):
+        return (0.05 + 0.9 * c_true) * c_mask
+
+    def compute_intervened_logits(self, c_mu, c_cov, c_true, c_mask):
+        c_intervened_probs = self._compute_intervened_probs(c_true, c_mask)
+        c_intervened_logits = torch.logit(c_intervened_probs, eps=1e-6)
+        return c_intervened_logits
+
+    def compute_intervention_cbm(self, c_pred, c_true, c_mask):
+        c_intervened_probs = self._compute_intervened_probs(c_true, c_mask)
+        c_intervened = c_intervened_probs + c_pred * (1 - c_mask)
+        return c_intervened
+
+
+class EmpiricalPercentileStrategy:
+    # Set intervened concepts to 5th and 95th percentile of training distribution
+    def __init__(self, train_loader, model, device, is_scbm=False):
+        concept_pred = []
+        with torch.no_grad():
+            for k, batch in enumerate(train_loader):
+                batch_features = batch["features"].to(device)
+                concepts_pred_probs, _, _ = model(
+                    batch_features, epoch=-1, validation=True
+                )
+                if is_scbm:
+                    # For SCBMs, we need to average over MCMC samples
+                    concepts_pred_probs = concepts_pred_probs.mean(-1)
+                concept_pred.append(concepts_pred_probs.cpu())
+        concept_pred = torch.cat(concept_pred, dim=0)
+        self.concept_pred_percentiles = torch.quantile(
+            concept_pred, q=torch.tensor([0.05, 0.95]), dim=0
+        ).to(device)
+
+    def _compute_intervened_perc(self, c_true, c_mask):
+        c_true_pred_perc = torch.where(
+            c_true == 1,
+            self.concept_pred_percentiles[1, :],
+            self.concept_pred_percentiles[0, :],
+        )
+        return c_true_pred_perc * c_mask
+
+    def compute_intervened_logits(self, c_mu, c_cov, c_true, c_mask):
+        c_intervened_probs = self._compute_intervened_perc(c_true, c_mask)
+        c_intervened_logits = torch.logit(c_intervened_probs, eps=1e-6)
+        return c_intervened_logits
+
+    def compute_intervention_cbm(self, c_pred, c_true, c_mask):
+        c_intervened_probs = self._compute_intervened_perc(c_true, c_mask)
+        c_intervened = c_intervened_probs + c_pred * (1 - c_mask)
+        return c_intervened
+
+
+class ConfIntervalOptimalStrategy:
+    """
+    A strategy for intervening on concepts using confidence interval bounds.
+
+    Args:
+        level (float, optional): The confidence level for the confidence interval.
+    """
+
+    # Set intervened concept logits to bounds of 90% confidence interval
+    def __init__(self, level=0.9):
+        self.level = level
+
+    def compute_intervened_logits(self, c_mu, c_cov, c_true, c_mask):
+        """
+        Compute the logits for the intervened-on concepts based on the confidence interval bounds.
+        
+        PERFORMANCE NOTE: This method uses expensive CPU-based scipy optimization.
+        For training with L_int_extension loss, consider using simple_perc strategy instead.
+
+        This method finds values that lie on the confidence region boundary and maximize the likelihood
+        of the intervened concepts.
+
+        Args:
+            c_mu (torch.Tensor): The predicted mean values of the concepts. Shape: (batch_size, num_concepts)
+            c_cov (torch.Tensor): The predicted covariance matrix of the concepts. Shape: (batch_size, num_concepts, num_concepts)
+            c_true (torch.Tensor): The ground-truth concept values. Shape: (batch_size, num_concepts)
+            c_mask (torch.Tensor): A mask indicating which concepts are intervened-on. Shape: (batch_size, num_concepts)
+
+        Returns:
+            torch.Tensor: The logits for the intervened-on concepts, rest filled with NaN. Shape: (batch_size, num_concepts)
+
+        Step-by-step procedure:
+            - The method first separates the intervened-on concepts from the others.
+            - It finds a good initial point on the confidence region boundary, that is spanned in the logit space.
+                It is defined as a vector with equal magnitude in each dimension, originating from c_mu and oriented
+                in the direction of the ground truth. Thus, only the scale factor of this vector needs to be found
+                s.t. it lies on the confidence region boundary.
+            - It defines the confidence region bounds on the logits, as well as defining some objective and derivatives
+              for faster optimization.
+            - It performs sample-wise constrained optimization to find the intervention logits by minimizing the concept BCE
+              while ensuring they lie within the boundary of the confidence region. The starting point from before is used as
+              initialization. Note that this is done sequentially for each sample, and therefore very slow.
+              The optimization problem also scales with the number of intervened-on concepts. There are certainly ways to make it much faster.
+            - After having found the optimal points at the confidence region bound, it permutes determined concept logits back into the original order.
+
+        """
+        # Find values that lie on confidence region ball
+        # Approach: Find theta s.t.  Λn(θ)= −2(ℓ(θ)−ℓ(θ^))=χ^2_{1-α,n} and minimize concept loss of intervened concepts.
+        # Note, theta^ is = mu, evaluated for the N(mu,Sigma) distribution, while theta is point on the boundary of the confidence region
+        # Then, we make theta by arg min Concept BCE(θ) s.t. Λn(θ) <= holds with 1-α = self.level for theta~N(0,Sigma) (not fully correct explanation, but intuition).
+        n_intervened = c_mask.sum(1)[0]
+        n_intervened = int(n_intervened.item()) # I changed
+        
+        # print(f"c_mask.shape: {c_mask.shape}, n_intervened: {n_intervened}")
+        
+        # Separate intervened-on concepts from others
+        indices = torch.argsort(c_mask, dim=1, descending=True, stable=True)
+        perm_cov = c_cov.gather(1, indices.unsqueeze(2).expand(-1, -1, c_cov.size(2)))
+        perm_cov = perm_cov.gather(
+            2, indices.unsqueeze(1).expand(-1, c_cov.size(1), -1)
+        )
+        
+        marginal_interv_cov = perm_cov[:, :n_intervened, :n_intervened]
+        marginal_interv_cov = numerical_stability_check(
+            marginal_interv_cov.float(), device=marginal_interv_cov.device
+        ).cpu()
+        target = (c_true * c_mask).gather(1, indices)[:, :n_intervened].float().cpu()
+        marginal_c_mu = c_mu.gather(1, indices)[:, :n_intervened].float().cpu()
+        interv_direction = (
+            ((2 * c_true - 1) * c_mask)
+            .gather(1, indices)[:, :n_intervened]
+            .float()
+            .cpu()
+        )  # direction
+        quantile_cutoff = chi2.ppf(q=self.level, df=n_intervened) # I changed from n_intervened.cpu()
+        quantile_cutoff = chi2.ppf(q=self.level, df=n_intervened) # I changed from n_intervened.cpu()
+
+        # Finding good init point on confidence region boundary (each dim with equal magnitude)
+        dist = MultivariateNormal(torch.zeros(n_intervened), marginal_interv_cov)
+        loglikeli_theta_hat = dist.log_prob(torch.zeros(n_intervened))
+
+        def conf_region(scale):
+            loglikeli_theta_star = dist.log_prob(scale * interv_direction)
+            log_likelihood_ratio = -2 * (loglikeli_theta_star - loglikeli_theta_hat)
+            return ((quantile_cutoff - log_likelihood_ratio) ** 2).sum(-1)
+
+        scale = minimize(
+            conf_region,
+            x0=torch.ones(c_mu.shape[0], 1),
+            method="bfgs",
+            max_iter=50,
+            tol=1e-5,
+        ).x
+        scale = (
+            scale.abs()
+        )  # in case negative root was found (note that both give same log-likelihood as its point-symmetric around 0)
+        x0 = marginal_c_mu + (interv_direction * scale)
+
+        # Define bounds on logits
+        lb_interv = torch.where(
+            interv_direction > 0, marginal_c_mu + 1e-4, torch.tensor(float("-inf"))
+        )
+        ub_interv = torch.where(
+            interv_direction < 0, marginal_c_mu - 1e-4, torch.tensor(float("inf"))
+        )
+
+        # Define confidence region
+        dist_logits = MultivariateNormal(marginal_c_mu, marginal_interv_cov)
+        loglikeli_theta_hat = dist_logits.log_prob(marginal_c_mu)
+        loglikeli_goal = -quantile_cutoff / 2 + loglikeli_theta_hat
+
+        # Initialize variables
+        cov_inverse = torch.linalg.inv(marginal_interv_cov)
+        interv_vector = torch.empty_like(marginal_c_mu)
+
+        #### Sample-wise constrained optimization (as there are no batched functions available out-of-the-box). Can surely be optimized
+        for i in range(marginal_c_mu.shape[0]):
+
+            # Define variables required for optimization
+            dist_logits_uni = MultivariateNormal(
+                marginal_c_mu[i], marginal_interv_cov[i]
+            )
+            loglikeli_goal_uni = loglikeli_goal[i]
+            target_uni = target[i]
+            inverse = cov_inverse[i]
+            marginal = marginal_c_mu[i]
+
+            # Define minimization objective and jacobian
+            def loglikeli_bern_uni(marginal_interv_vector):
+                return F.binary_cross_entropy_with_logits(
+                    input=marginal_interv_vector, target=target_uni, reduction="sum"
+                )
+
+            def jac_min_fct(x):
+                return torch.sigmoid(x) - target_uni
+
+            # Define confidence region constraint and its jacobian
+            def conf_region_uni(marginal_interv_vector):
+                loglikeli_theta_star = dist_logits_uni.log_prob(marginal_interv_vector)
+                return loglikeli_theta_star - loglikeli_goal_uni
+
+            def jac_constraint(x):
+                return -(inverse @ (x - marginal).unsqueeze(-1)).squeeze(-1)
+
+            # Wrapper for scipy "minimize" function
+            # Find intervention logits by minimizing the concept BCE s.t. they still lie on the boundary of the confidence region
+            
+            # I changed
+            x0_i = x0[i].detach().cpu().double() #x0[i]
+            lb_interv_i = lb_interv[i].detach().cpu().double() #lb_interv[i]
+            ub_interv_i = ub_interv[i].detach().cpu().double() #ub_interv[i]
+            
+            
+            minimum = minimize_constr(
+                f=loglikeli_bern_uni,
+                x0=x0_i,
+                jac=jac_min_fct,
+                method="SLSQP",
+                constr={
+                    "fun": conf_region_uni,
+                    "lb": 0,
+                    "ub": float("inf"),
+                    "jac": jac_constraint,
+                },
+                bounds={"lb": lb_interv_i, "ub": ub_interv_i},
+                max_iter=50,
+                tol=1e-4 * n_intervened,
+            )
+            # I changed from n_intervened.cpu()
+            interv_vector[i] = minimum.x
+
+        # Permute intervened concept logits back into original order
+        indices_reversed = torch.argsort(indices)
+        interv_vector_unordered = torch.full_like(
+            c_mu, float("nan"), device=c_mu.device, dtype=torch.float32
+        )
+        interv_vector_unordered[:, :n_intervened] = interv_vector
+        c_intervened_logits = interv_vector_unordered.gather(1, indices_reversed)
+
+        return c_intervened_logits
+
+
+class HardCBMStrategy:
+    # Set intervened concepts to 0 & 1
+    def __init__(self):
+        pass
+
+    def compute_intervention_cbm(self, c_pred, c_true, c_mask):
+        c_intervened = c_true * c_mask + c_pred * (1 - c_mask)
+        return c_intervened

@@ -1,0 +1,1127 @@
+"""
+AwA2 dataset loader with concept labels, designed to match the interface of the
+CUB loader used in this codebase.
+
+This version uses the precomputed Xian et al. ResNet-101 embeddings stored in
+xlsa17/data/AWA2/res101.mat instead of loading and transforming JPEG pixels.
+
+Expected AwA2 structure
+-----------------------
+<data_path>/AwA2/
+    classes.txt
+    predicate-matrix-binary.txt
+    JPEGImages/
+        antelope/
+        grizzly+bear/
+        ...
+    xlsa17/
+        data/
+            AWA2/
+                res101.mat
+
+Split behaviour
+---------------
+1. 50-way supervised image classification.
+2. 85 binary, class-level attributes from predicate-matrix-binary.txt.
+3. The existing CEM-style random image-level train/val/test split is preserved
+   exactly (60% / 20% / 20%, seed 42 when first created).
+4. train_split.npz / val_split.npz / test_split.npz still define split
+   membership by image path. Each image path is matched to the corresponding
+   row in res101.mat and the returned "features" tensor is the 2048-D
+   precomputed ResNet-101 embedding.
+5. The original xlsa17 zero-shot train/test split is NOT used.
+
+Incomplete concept datasets
+---------------------------
+Incomplete datasets are stored under:
+
+<data_path>/AwA2/incomplete_data/<dataset_name>/
+
+Only the concept matrix is reduced. The image split is intentionally kept
+unchanged, so full and incomplete runs use exactly the same images and class
+labels.
+"""
+
+import json
+import os
+import random
+from collections import OrderedDict
+
+import numpy as np
+import torch
+from PIL import Image
+from scipy import io
+from torch.utils.data import Dataset
+import torchvision.transforms as transforms
+
+
+N_CLASSES = 50
+N_CONCEPTS = 85
+AWA2_FOLDER = "AwA2"
+DEFAULT_SEED = 42
+
+
+# Same 85 concepts, in the same order, as predicate-matrix-binary.txt in AwA2
+# and the CEM/ECBM AwA2 processing code.
+CONCEPT_SEMANTICS = [
+    "black", "white", "blue", "brown", "gray", "orange", "red", "yellow",
+    "patches", "spots", "stripes", "furry", "hairless", "toughskin",
+    "big", "small", "bulbous", "lean", "flippers", "hands", "hooves",
+    "pads", "paws", "longleg", "longneck", "tail", "chewteeth",
+    "meatteeth", "buckteeth", "strainteeth", "horns", "claws", "tusks",
+    "smelly", "flys", "hops", "swims", "tunnels", "walks", "fast",
+    "slow", "strong", "weak", "muscle", "bipedal", "quadrapedal",
+    "active", "inactive", "nocturnal", "hibernate", "agility", "fish",
+    "meat", "plankton", "vegetation", "insects", "forager", "grazer",
+    "hunter", "scavenger", "skimmer", "stalker", "newworld", "oldworld",
+    "arctic", "coastal", "desert", "bush", "plains", "forest", "fields",
+    "jungle", "mountains", "ocean", "ground", "water", "tree", "cave",
+    "fierce", "timid", "smart", "group", "solitary", "nestspot",
+    "domestic",
+]
+
+
+# Semantic grouping from the CEM/ECBM AwA2 processing code.
+# OrderedDict is used so CEM-style random group sampling is reproducible with
+# the same group order.
+_CONCEPT_GROUP_NAMES = OrderedDict([
+    ("color", ["black", "white", "blue", "brown", "gray", "orange", "red", "yellow"]),
+    ("fur_pattern", ["patches", "spots", "stripes", "furry", "hairless", "toughskin"]),
+    ("size", ["big", "small", "bulbous", "lean"]),
+    ("limb_shape", ["flippers", "hands", "hooves", "pads", "paws", "longleg", "longneck"]),
+    ("tail", ["tail"]),
+    ("teeth_type", ["chewteeth", "meatteeth", "buckteeth", "strainteeth"]),
+    ("horns", ["horns"]),
+    ("claws", ["claws"]),
+    ("tusks", ["tusks"]),
+    ("smelly", ["smelly"]),
+    ("transport_mechanism", ["flys", "hops", "swims", "tunnels", "walks"]),
+    ("speed", ["fast", "slow"]),
+    ("strength", ["strong", "weak"]),
+    ("muscle", ["muscle"]),
+    ("movement_move", ["bipedal", "quadrapedal"]),
+    ("active", ["active", "inactive"]),
+    ("nocturnal", ["nocturnal"]),
+    ("hibernate", ["hibernate"]),
+    ("agility", ["agility"]),
+    ("diet", ["fish", "meat", "plankton", "vegetation", "insects"]),
+    ("feeding_type", ["forager", "grazer", "hunter", "scavenger", "skimmer", "stalker"]),
+    ("general_location", ["newworld", "oldworld", "arctic"]),
+    ("biome", ["coastal", "desert", "bush", "plains", "forest", "fields", "jungle", "mountains", "ocean", "ground", "water", "tree", "cave"]),
+    ("fierceness", ["fierce", "timid"]),
+    ("smart", ["smart"]),
+    ("social_mode", ["group", "solitary"]),
+    ("nestspot", ["nestspot"]),
+    ("domestic", ["domestic"]),
+])
+
+CONCEPT_GROUPS = OrderedDict(
+    (
+        group_name,
+        [CONCEPT_SEMANTICS.index(concept_name) for concept_name in concept_names],
+    )
+    for group_name, concept_names in _CONCEPT_GROUP_NAMES.items()
+)
+
+
+# -----------------------------------------------------------------------------
+# Path / metadata helpers
+# -----------------------------------------------------------------------------
+
+def _get_awa2_root(config_data):
+    """Return <config.data_path>/AwA2."""
+    return os.path.join(config_data.data_path, AWA2_FOLDER)
+
+
+def _get_incomplete_root(config_data):
+    """
+    Return the folder that stores incomplete AwA2 concept sets.
+
+    By default this is AwA2/incomplete_data. If config.incomplete_dir is set,
+    it is used so this matches the convention in the CUB loader.
+    """
+    incomplete_dir = getattr(config_data, "incomplete_dir", "incomplete_data")
+    return os.path.join(_get_awa2_root(config_data), incomplete_dir)
+
+
+def _get_incomplete_dataset_name(config_data):
+    """
+    Get the configured incomplete dataset folder name.
+
+    `pkl_file_dir` is accepted deliberately because the existing CUB training
+    pipeline already uses that config field. The name is a misnomer here - an
+    incomplete AwA2 set is a reduced predicate matrix, not a set of pkls - but every
+    writer in the pipeline uses it (check_AwA2_data assigns it, train.py logs it,
+    inference.py reads it back out of log.txt), so a second read-side-only alias would
+    only produce runs that train once and cannot be re-analysed.
+    """
+    if hasattr(config_data, "pkl_file_dir") and config_data.pkl_file_dir:
+        return str(config_data.pkl_file_dir).strip("/")
+    raise ValueError(
+        "For incomplete AwA2, set data.pkl_file_dir to the folder of an existing "
+        "concept set (same config field as CUB). Sets are created explicitly, via "
+        "create_custom_incomplete_dataset or the create_random_incomplete_dataset_* "
+        "helpers in this module."
+    )
+
+
+def get_incomplete_concept_set_path(config_data):
+    """Absolute path of the configured incomplete AwA2 concept set.
+
+    Public counterpart of the private path helpers above. train.py and inference.py have
+    to test for and read back an incomplete set, and this keeps the
+    AwA2/<incomplete_dir>/<folder> layout in one place rather than re-derived at each call
+    site - the role CUB_LABEL_ROOT plays for the CUB family.
+    """
+    return os.path.join(
+        _get_incomplete_root(config_data),
+        _get_incomplete_dataset_name(config_data),
+    )
+
+
+def get_num_concepts_incomplete(config_data):
+    """Number of concepts retained by the configured incomplete concept set.
+
+    Read off the reduced predicate matrix rather than info.json, so the value is the one
+    the loader will actually hand the model (same reason check_CUB_data reads the pkl
+    contents instead of info.txt).
+    """
+    return int(_load_predicate_matrix(config_data, incomplete=True).shape[1])
+
+
+def _load_class_to_index(root_dir):
+    """Match CEM: class indices follow the line order in classes.txt."""
+    class_to_index = {}
+    classes_path = os.path.join(root_dir, "classes.txt")
+    with open(classes_path, "r") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 2:
+                raise ValueError(f"Unexpected line in classes.txt: {line!r}")
+            class_name = parts[1].strip()
+            class_to_index[class_name] = len(class_to_index)
+
+    if len(class_to_index) != N_CLASSES:
+        raise ValueError(
+            f"Expected {N_CLASSES} classes in {classes_path}, found {len(class_to_index)}."
+        )
+    # classes idx are 0-based, matching the CEM/ECBM AwA2 processing code.
+    return class_to_index
+
+
+def _load_predicate_matrix(config_data, incomplete=False):
+    """Load the full or reduced class x concept binary matrix."""
+    awa2_root = _get_awa2_root(config_data)
+
+    if incomplete:
+        dataset_name = _get_incomplete_dataset_name(config_data)
+        matrix_path = os.path.join(
+            _get_incomplete_root(config_data),
+            dataset_name,
+            "predicate-matrix-binary.txt",
+        )
+        print(f"Using incomplete AwA2 concept matrix from {dataset_name}")
+    else:
+        matrix_path = os.path.join(awa2_root, "predicate-matrix-binary.txt")
+
+    matrix = np.asarray(np.genfromtxt(matrix_path, dtype=int))
+
+    if matrix.ndim != 2 or matrix.shape[0] != N_CLASSES:
+        raise ValueError(
+            f"Expected an AwA2 concept matrix with {N_CLASSES} rows, got {matrix.shape} "
+            f"from {matrix_path}."
+        )
+
+    return matrix
+
+
+def _resolve_saved_image_path(saved_path, root_dir):
+    """
+    Resolve paths stored in CEM-style split .npz files.
+
+    CEM stores absolute paths. If the dataset/split file was copied from local
+    to the cluster, the old absolute path may no longer exist. In that case we
+    keep the same split membership and re-root the suffix after JPEGImages/.
+    """
+    saved_path = str(saved_path)
+    if os.path.exists(saved_path):
+        return saved_path
+
+    normalized = saved_path.replace("\\", "/")
+    marker = "/JPEGImages/"
+    if marker in normalized:
+        suffix = normalized.split(marker, 1)[1]
+        return os.path.join(root_dir, "JPEGImages", *suffix.split("/"))
+
+    if normalized.startswith("JPEGImages/"):
+        return os.path.join(root_dir, *normalized.split("/"))
+
+    return saved_path
+
+
+def _get_res101_path(config_data):
+    """
+    Return the path to Xian et al.'s precomputed AwA2 ResNet-101 features.
+
+    Default:
+        <config.data_path>/AwA2/xlsa17/data/AWA2/res101.mat
+
+    An explicit config.res101_path or config.resnet_101_path overrides the
+    default, if present.
+    """
+    explicit_path = getattr(config_data, "res101_path", None)
+    if not explicit_path:
+        explicit_path = getattr(config_data, "resnet_101_path", None)
+
+    if explicit_path:
+        return str(explicit_path)
+
+    return os.path.join(
+        _get_awa2_root(config_data),
+        "xlsa17",
+        "data",
+        "AWA2",
+        "res101.mat",
+    )
+
+
+def _matlab_string(value):
+    """Convert scipy.loadmat's MATLAB string representation to a Python str."""
+    while isinstance(value, np.ndarray):
+        if value.dtype.kind in {"U", "S"}:
+            return "".join(value.astype(str).ravel().tolist())
+        if value.size == 1:
+            value = value.item()
+        else:
+            # This should not normally be needed for xlsa17 image_files, but
+            # gives a readable fallback for MATLAB character arrays.
+            return "".join(str(x) for x in value.ravel().tolist())
+
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+
+    return str(value)
+
+
+def _normalize_awa2_image_key(path):
+    """
+    Convert an AwA2 image path to a machine-independent key.
+
+    Both the saved split files and res101.mat may contain absolute paths from
+    different machines. We therefore match using the path relative to
+    JPEGImages, e.g.:
+        antelope/antelope_10001.jpg
+
+    If JPEGImages is not present in the stored path, the final
+    <class>/<filename> components are used.
+    """
+    normalized = _matlab_string(path).replace("\\", "/").strip()
+
+    marker = "/JPEGImages/"
+    if marker in normalized:
+        return normalized.split(marker, 1)[1]
+
+    if normalized.startswith("JPEGImages/"):
+        return normalized[len("JPEGImages/"):]
+
+    parts = [part for part in normalized.split("/") if part]
+    if len(parts) >= 2:
+        return "/".join(parts[-2:])
+    if parts:
+        return parts[-1]
+
+    raise ValueError(f"Could not normalize empty AwA2 image path: {path!r}")
+
+
+def _load_res101_embeddings(config_data):
+    """
+    Load Xian et al.'s precomputed ResNet-101 embeddings.
+
+    Returns
+    -------
+    features : np.ndarray, shape [N, D]
+        Usually [37322, 2048].
+    labels : np.ndarray, shape [N]
+        0-based class labels from res101.mat.
+    image_to_index : dict[str, int]
+        Maps normalized <class>/<filename> image keys to embedding rows.
+    """
+    res101_path = _get_res101_path(config_data)
+
+    if not os.path.exists(res101_path):
+        raise FileNotFoundError(
+            "Could not find AwA2 ResNet-101 embeddings at:\n"
+            f"  {res101_path}\n"
+            "Expected default location: "
+            "<data_path>/AwA2/xlsa17/data/AWA2/res101.mat"
+        )
+
+    mat = io.loadmat(res101_path)
+
+    required_keys = {"features", "labels", "image_files"}
+    missing_keys = required_keys.difference(mat.keys())
+    if missing_keys:
+        raise KeyError(
+            f"{res101_path} is missing required keys: {sorted(missing_keys)}. "
+            f"Available keys: {sorted(k for k in mat.keys() if not k.startswith('__'))}"
+        )
+
+    # xlsa17 stores features as [feature_dim, n_images], so transpose to
+    # [n_images, feature_dim].
+    features = np.asarray(mat["features"], dtype=np.float32).T
+    labels = np.asarray(mat["labels"]).squeeze().astype(np.int64) - 1
+    image_files = np.asarray(mat["image_files"]).squeeze()
+
+    if features.shape[0] != labels.shape[0]:
+        raise ValueError(
+            f"Feature/label count mismatch in {res101_path}: "
+            f"{features.shape[0]} features vs {labels.shape[0]} labels."
+        )
+
+    if len(image_files) != features.shape[0]:
+        raise ValueError(
+            f"Feature/image_files count mismatch in {res101_path}: "
+            f"{features.shape[0]} features vs {len(image_files)} image paths."
+        )
+
+    image_to_index = {}
+    for idx, raw_path in enumerate(image_files):
+        key = _normalize_awa2_image_key(raw_path)
+        if key in image_to_index:
+            raise ValueError(
+                f"Duplicate normalized image key in res101.mat: {key}"
+            )
+        image_to_index[key] = idx
+
+    print(
+        "Loaded AwA2 ResNet-101 embeddings: "
+        f"features={features.shape}, labels={labels.shape}, "
+        f"image_paths={len(image_to_index)}"
+    )
+
+    return features, labels, image_to_index
+
+
+# -----------------------------------------------------------------------------
+# Dataset and CEM-compatible splits
+# -----------------------------------------------------------------------------
+
+class AWA2_DatasetGenerator(Dataset):
+    """
+    AwA2 Dataset object with the same sample dictionary interface as the CUB
+    loader in this codebase.
+
+    Split membership still comes from the existing saved image-path split.
+    Instead of opening the JPEG, each image path is matched to its precomputed
+    ResNet-101 embedding in res101.mat.
+
+    Each image gets the class-level binary attribute vector corresponding to
+    its class in predicate-matrix-binary.txt.
+    """
+
+    def __init__(
+        self,
+        data,
+        predicate_binary_mat,
+        embeddings,
+        embedding_labels,
+        image_to_embedding_index,
+    ):
+        self.data = data
+        self.predicate_binary_mat = np.asarray(
+            predicate_binary_mat,
+            dtype=np.float32,
+        )
+        self.embeddings = embeddings
+        self.embedding_labels = embedding_labels
+        self.image_to_embedding_index = image_to_embedding_index
+
+    def __getitem__(self, index):
+        sample = self.data[index]
+        img_path = sample["img_path"]
+        image_label = int(sample["class_label"])
+
+        # Preserve the exact image membership of train_split.npz /
+        # val_split.npz / test_split.npz, but replace the JPEG pixels with the
+        # matching precomputed ResNet-101 feature vector.
+        image_key = _normalize_awa2_image_key(img_path)
+
+        if image_key not in self.image_to_embedding_index:
+            raise KeyError(
+                "Could not find a ResNet-101 embedding for AwA2 image:\n"
+                f"  path: {img_path}\n"
+                f"  normalized key: {image_key}"
+            )
+
+        embedding_idx = self.image_to_embedding_index[image_key]
+        embedding_label = int(self.embedding_labels[embedding_idx])
+
+        # Catch any disagreement between classes.txt / saved split labels and
+        # the xlsa17 res101.mat label ordering instead of silently training on
+        # mismatched labels.
+        if embedding_label != image_label:
+            raise ValueError(
+                f"AwA2 label mismatch for {image_key}: "
+                f"saved split label={image_label}, "
+                f"res101.mat label={embedding_label}."
+            )
+
+        image_features = torch.from_numpy(self.embeddings[embedding_idx])
+        image_attr = self.predicate_binary_mat[image_label, :].astype(np.float32)
+
+        # Same dictionary keys used by CUB_DatasetGenerator.
+        return {
+            "img_code": index,
+            "labels": image_label,
+            "features": image_features,
+            "concepts": image_attr,
+        }
+
+    def __len__(self):
+        return len(self.data)
+
+
+def _generate_cem_splits(root_dir, seed=DEFAULT_SEED, train_size=0.6, val_size=0.2):
+    """
+    Generate the same random image-level 60/20/20 split used by the CEM AwA2
+    processing script and save train_split.npz / val_split.npz / test_split.npz.
+    """
+    # {'antelope': 0, 'grizzly+bear': 1, 'killer+whale': 2, ...}
+    class_to_index = _load_class_to_index(root_dir)
+
+    image_paths = []
+    image_classes = []
+    img_dir = os.path.join(root_dir, "JPEGImages")
+
+    for walk_root, _, files in os.walk(img_dir):
+        for filename in files:
+            if filename.lower().endswith(".jpg"):
+                img_path = os.path.abspath(os.path.join(walk_root, filename))
+                parent_dir = os.path.basename(os.path.dirname(img_path))
+                image_paths.append(img_path)
+                # append the class index corresponding to the parent directory of the image
+                image_classes.append(class_to_index[parent_dir])
+
+    if not image_paths:
+        raise ValueError(f"No .jpg images found under {img_dir}")
+
+    # Deliberately match the original CEM implementation.
+    np.random.seed(seed)
+    indices = np.arange(len(image_paths))
+    np.random.shuffle(indices)
+
+    train_end = int(train_size * len(image_paths))
+    val_end = train_end + int(val_size * len(image_paths))
+
+    image_paths = np.asarray(image_paths)
+    image_classes = np.asarray(image_classes, dtype=np.int64)
+
+    split_specs = {
+        "train": indices[:train_end],
+        "val": indices[train_end:val_end],
+        "test": indices[val_end:],
+    }
+
+    for split_name, split_indices in split_specs.items():
+        np.savez(
+            os.path.join(root_dir, f"{split_name}_split.npz"),
+            paths=image_paths[split_indices],
+            labels=image_classes[split_indices],
+        )
+
+    # Manifest next to the .npz files: the split itself carries no record of how it
+    # was produced, and the loader reuses whatever is on disk regardless of the seed
+    # it was called with, so without this a run's config.seed cannot be checked
+    # against the split it actually trained on.
+    with open(os.path.join(root_dir, "split_info.json"), "w") as f:
+        json.dump(
+            {
+                "seed": int(seed),
+                "train_size": train_size,
+                "val_size": val_size,
+                "test_size": 1.0 - train_size - val_size,
+                "n_images": len(image_paths),
+                "split_counts": {
+                    name: int(len(idx)) for name, idx in split_specs.items()
+                },
+            },
+            f,
+            indent=2,
+        )
+
+    print(
+        "Generated CEM-style AwA2 splits: "
+        f"train={len(split_specs['train'])}, "
+        f"val={len(split_specs['val'])}, "
+        f"test={len(split_specs['test'])}"
+    )
+
+
+def train_val_test_split_AWA2(config_data, seed=DEFAULT_SEED):
+    """
+    Load (or create) the CEM-style AwA2 60/20/20 image-level split.
+
+    Returns three lists of dictionaries with keys:
+        img_path, class_label
+    """
+    root_dir = _get_awa2_root(config_data)
+
+    for split_name in ("train", "val", "test"):
+        split_path = os.path.join(root_dir, f"{split_name}_split.npz")
+        if not os.path.exists(split_path):
+            print(
+                "AwA2 split files not found. Generating CEM-style train/val/test "
+                f"split with seed {seed}."
+            )
+            # Write all 3 split files at once, then break out of the loop.
+            _generate_cem_splits(root_dir, seed=seed)
+            break
+
+    output = {}
+    for split_name in ("train", "val", "test"):
+        split_path = os.path.join(root_dir, f"{split_name}_split.npz")
+        split_info = np.load(split_path)
+        paths = split_info["paths"]
+        labels = split_info["labels"]
+
+        split_data = []
+        for img_path, class_label in zip(paths, labels):
+            resolved_path = _resolve_saved_image_path(img_path, root_dir)
+            split_data.append(
+                {
+                    "img_path": resolved_path,
+                    "class_label": int(class_label),
+                }
+            )
+        output[split_name] = split_data
+
+    print(
+        "AwA2 samples: "
+        f"train={len(output['train'])}, "
+        f"val={len(output['val'])}, "
+        f"test={len(output['test'])}"
+    )
+    return output["train"], output["val"], output["test"]
+
+
+# -----------------------------------------------------------------------------
+# CEM-compatible image transforms
+# -----------------------------------------------------------------------------
+
+def get_AWA2_transforms(image_size=224, augment_data=False):
+    """
+    Return train/test transforms matching the CEM AwA2 processing.
+
+    Important: in the original CEM code, if augment_data=False then the train
+    split uses the same deterministic Resize + CenterCrop path as validation
+    and test.
+    """
+    scale = 256.0 / 224.0
+
+    test_transform = transforms.Compose([
+        transforms.Resize((int(image_size * scale), int(image_size * scale))),
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+    ])
+
+    if augment_data:
+        train_transform = transforms.Compose([
+            transforms.RandomResizedCrop(
+                image_size,
+                scale=(0.7, 1.0),
+                ratio=(0.75, 1.3333333333333333),
+                interpolation=2,
+            ),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ])
+    else:
+        train_transform = test_transform
+
+    return train_transform, test_transform
+
+
+def get_AWA2_dataloaders(config, incomplete=False):
+    """
+    Return train/val/test Dataset objects using precomputed ResNet-101 features.
+
+    The existing train_split.npz / val_split.npz / test_split.npz files are
+    reused unchanged, so this preserves exactly the same image-level
+    train/validation/test membership as the previous JPEG-based loader.
+
+    Despite the historical function name, this returns Dataset objects rather
+    than torch DataLoader objects, just like the attached CUB implementation.
+    """
+    seed = getattr(config, "seed", DEFAULT_SEED)
+
+    # IMPORTANT: this is the same saved 60/20/20 split used before.
+    train_imgs, val_imgs, test_imgs = train_val_test_split_AWA2(
+        config,
+        seed=seed,
+    )
+
+    predicate_binary_mat = _load_predicate_matrix(
+        config,
+        incomplete=incomplete,
+    )
+
+    embeddings, embedding_labels, image_to_embedding_index = (
+        _load_res101_embeddings(config)
+    )
+
+    image_datasets = {
+        "train": AWA2_DatasetGenerator(
+            train_imgs,
+            predicate_binary_mat,
+            embeddings,
+            embedding_labels,
+            image_to_embedding_index,
+        ),
+        "val": AWA2_DatasetGenerator(
+            val_imgs,
+            predicate_binary_mat,
+            embeddings,
+            embedding_labels,
+            image_to_embedding_index,
+        ),
+        "test": AWA2_DatasetGenerator(
+            test_imgs,
+            predicate_binary_mat,
+            embeddings,
+            embedding_labels,
+            image_to_embedding_index,
+        ),
+    }
+
+    return (
+        image_datasets["train"],
+        image_datasets["val"],
+        image_datasets["test"],
+    )
+
+
+# -----------------------------------------------------------------------------
+# Concept-group utilities
+# -----------------------------------------------------------------------------
+
+def get_attribute_parts_to_indices(config_data=None):
+    """Return the CEM AwA2 semantic concept groups as 0-based indices."""
+    return OrderedDict((k, list(v)) for k, v in CONCEPT_GROUPS.items())
+
+
+def get_concept_groups_current_space(config_data, incomplete=False):
+    """
+    CEM concept groups as indices into the concept space the model actually sees.
+
+    Complete run: CONCEPT_GROUPS over the 85 predicates. Incomplete run: the
+    concept_groups.json every incomplete set is saved with, already re-indexed by
+    _remap_concept_groups and holding non-empty groups only. A set without that file is
+    re-derived from info.json's selected concepts. Used by the `random_group` intervention
+    policy (utils/intervention.py); the CUB counterpart lives in datasets/CUB_dataset.py.
+    """
+    if not incomplete:
+        return get_attribute_parts_to_indices(config_data)
+    folder = get_incomplete_concept_set_path(config_data)
+    groups_path = os.path.join(folder, "concept_groups.json")
+    if os.path.exists(groups_path):
+        with open(groups_path, "r") as f:
+            groups = json.load(f, object_pairs_hook=OrderedDict)
+        return OrderedDict(
+            (name, [int(i) for i in idxs]) for name, idxs in groups.items() if idxs
+        )
+    with open(os.path.join(folder, "info.json"), "r") as f:
+        selected = json.load(f)["selected_concept_indices_original_space"]
+    _, new_groups = _remap_concept_groups(selected)
+    return new_groups
+
+
+def _next_incomplete_dataset_dir(config_data, mode_name):
+    """Create a new numbered incomplete-data folder, similar to the CUB code."""
+    root = _get_incomplete_root(config_data)
+    os.makedirs(root, exist_ok=True)
+
+    # Set SCBM_ENV_TAG to distinguish splits generated in different places; defaults to
+    # "local", the tag the shipped splits carry.
+    environment = os.environ.get("SCBM_ENV_TAG", "local")
+    prefix = f"awa2_incomplete_{environment}_{mode_name}_"
+
+    largest_digit = 0
+    for folder_name in os.listdir(root):
+        if folder_name.startswith(prefix):
+            suffix = folder_name[len(prefix):]
+            if suffix.isdigit():
+                largest_digit = max(largest_digit, int(suffix))
+
+    new_dir_name = f"{prefix}{largest_digit + 1}"
+    new_folder_path = os.path.join(root, new_dir_name)
+    os.makedirs(new_folder_path, exist_ok=False)
+    return new_dir_name, new_folder_path
+
+
+def _remap_concept_groups(selected_concepts):
+    """Remap original 0..84 concept indices into a reduced concept space."""
+    selected_concepts = [int(x) for x in selected_concepts]
+    remap = {old_idx: new_idx for new_idx, old_idx in enumerate(selected_concepts)}
+    selected_set = set(selected_concepts)
+
+    new_groups = OrderedDict()
+    for group_name, original_indices in CONCEPT_GROUPS.items():
+        kept = [remap[idx] for idx in original_indices if idx in selected_set]
+        if kept:
+            new_groups[group_name] = kept
+
+    return remap, new_groups
+
+
+def _save_incomplete_concept_set(
+    config_data,
+    selected_concepts,
+    mode_name,
+    metadata,
+):
+    """
+    Save a persistent reduced AwA2 predicate matrix and metadata.
+
+    The original image split files remain untouched.
+    """
+    selected_concepts = sorted(int(x) for x in selected_concepts)
+    if not selected_concepts:
+        raise ValueError("An incomplete dataset must retain at least one concept.")
+    if min(selected_concepts) < 0 or max(selected_concepts) >= N_CONCEPTS:
+        raise ValueError("selected_concepts contains an index outside 0..84.")
+
+    full_matrix_path = os.path.join(
+        _get_awa2_root(config_data),
+        "predicate-matrix-binary.txt",
+    )
+    full_matrix = np.asarray(np.genfromtxt(full_matrix_path, dtype=int))
+    if full_matrix.shape != (N_CLASSES, N_CONCEPTS):
+        raise ValueError(
+            f"Expected full AwA2 matrix shape {(N_CLASSES, N_CONCEPTS)}, "
+            f"got {full_matrix.shape}."
+        )
+
+    reduced_matrix = full_matrix[:, selected_concepts]
+    removed_concepts = sorted(set(range(N_CONCEPTS)) - set(selected_concepts))
+    old_to_new, new_groups = _remap_concept_groups(selected_concepts)
+
+    new_dir_name, new_folder_path = _next_incomplete_dataset_dir(
+        config_data,
+        mode_name=mode_name,
+    )
+
+    np.savetxt(
+        os.path.join(new_folder_path, "predicate-matrix-binary.txt"),
+        reduced_matrix,
+        fmt="%d",
+    )
+    np.save(
+        os.path.join(new_folder_path, "selected_concepts.npy"),
+        np.asarray(selected_concepts, dtype=np.int64),
+    )
+    np.save(
+        os.path.join(new_folder_path, "removed_concepts.npy"),
+        np.asarray(removed_concepts, dtype=np.int64),
+    )
+
+    selected_names = [CONCEPT_SEMANTICS[idx] for idx in selected_concepts]
+    removed_names = [CONCEPT_SEMANTICS[idx] for idx in removed_concepts]
+
+    with open(os.path.join(new_folder_path, "concept_names.txt"), "w") as f:
+        for new_idx, (old_idx, name) in enumerate(zip(selected_concepts, selected_names)):
+            f.write(f"{new_idx}\t{old_idx}\t{name}\n")
+
+    with open(os.path.join(new_folder_path, "concept_groups.json"), "w") as f:
+        json.dump(new_groups, f, indent=2)
+
+    all_metadata = {
+        "mode": metadata.get("mode", mode_name),
+        "num_original_concepts": N_CONCEPTS,
+        "num_remaining_concepts": len(selected_concepts),
+        "num_removed_concepts": len(removed_concepts),
+        "selected_concept_indices_original_space": selected_concepts,
+        "selected_concept_names": selected_names,
+        "removed_concept_indices_original_space": removed_concepts,
+        "removed_concept_names": removed_names,
+        "old_to_new_concept_index": old_to_new,
+        **metadata,
+    }
+
+    with open(os.path.join(new_folder_path, "info.json"), "w") as f:
+        json.dump(all_metadata, f, indent=2)
+
+    # Human-readable equivalent, convenient when inspecting experiment folders.
+    with open(os.path.join(new_folder_path, "info.txt"), "w") as f:
+        for key, value in all_metadata.items():
+            f.write(f"{key}: {value}\n")
+
+    print(f"Saved incomplete AwA2 concept set to {new_folder_path}")
+    print(
+        f"Concepts: {N_CONCEPTS} -> {len(selected_concepts)} "
+        f"(removed {len(removed_concepts)})"
+    )
+
+    # Keep the same return pattern as your CUB incomplete-data functions.
+    return new_dir_name + "/", len(selected_concepts)
+
+
+
+# -----------------------------------------------------------------------------
+# Incomplete AwA2 creation: Specify concepts to keep
+# -----------------------------------------------------------------------------
+def create_custom_incomplete_dataset(
+    config_data,
+    selected_concept_names,
+):
+    """
+    Create an incomplete AwA2 dataset using a manually specified
+    set of concepts to KEEP.
+
+    Parameters
+    ----------
+    config_data :
+        Dataset configuration.
+
+    selected_concept_names : list[str]
+        Concept names from CONCEPT_SEMANTICS that should be retained.
+
+    Returns
+    -------
+    new_dir_name : str
+        Name of the new incomplete dataset folder.
+
+    num_concepts : int
+        Number of concepts retained.
+    """
+
+    if not selected_concept_names:
+        raise ValueError("You must select at least one concept.")
+
+    # Check that every requested concept actually exists
+    invalid_concepts = [
+        concept
+        for concept in selected_concept_names
+        if concept not in CONCEPT_SEMANTICS
+    ]
+
+    if invalid_concepts:
+        raise ValueError(
+            f"Unknown AwA2 concepts: {invalid_concepts}"
+        )
+
+    # Convert names -> original 0-based AwA2 indices
+    selected_concepts = [
+        CONCEPT_SEMANTICS.index(concept)
+        for concept in selected_concept_names
+    ]
+
+    # Remove duplicates and restore original AwA2 concept ordering
+    selected_concepts = sorted(set(selected_concepts))
+
+    print("Keeping AwA2 concepts:")
+    for idx in selected_concepts:
+        print(f"  {idx}: {CONCEPT_SEMANTICS[idx]}")
+
+    return _save_incomplete_concept_set(
+        config_data,
+        selected_concepts=selected_concepts,
+        mode_name="custom",
+        metadata={
+            "mode": "manually selected concepts",
+            "requested_concept_names": selected_concept_names,
+        },
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -----------------------------------------------------------------------------
+# Incomplete AwA2 creation: CUB-style removal API
+# -----------------------------------------------------------------------------
+
+def create_random_incomplete_dataset_attr_groups(
+    config_data,
+    num_attribute_groups_remove=1,
+    seed=None,
+):
+    """
+    Remove complete AwA2 semantic attribute groups, analogous to the CUB
+    group-removal helper.
+    """
+    group_names = list(CONCEPT_GROUPS.keys())
+    if not 0 <= num_attribute_groups_remove < len(group_names):
+        raise ValueError(
+            f"num_attribute_groups_remove must be in [0, {len(group_names) - 1}]"
+        )
+
+    rng = random.Random(seed) if seed is not None else random
+    remove_attribute_groups = rng.sample(group_names, num_attribute_groups_remove)
+
+    remove_attribute_indices = []
+    for group_name in remove_attribute_groups:
+        remove_attribute_indices.extend(CONCEPT_GROUPS[group_name])
+    remove_attribute_indices = sorted(set(remove_attribute_indices))
+
+    selected_concepts = [
+        idx for idx in range(N_CONCEPTS) if idx not in set(remove_attribute_indices)
+    ]
+
+    print(
+        f"Removing AwA2 attribute groups: {remove_attribute_groups}\n"
+        f"Removing original concept indices: {remove_attribute_indices}"
+    )
+
+    return _save_incomplete_concept_set(
+        config_data,
+        selected_concepts=selected_concepts,
+        mode_name="groups",
+        metadata={
+            "mode": "remove attribute groups",
+            "removed_attribute_groups": remove_attribute_groups,
+            "num_attribute_groups_removed": num_attribute_groups_remove,
+            "seed": seed,
+        },
+    )
+
+
+def create_random_incomplete_dataset_indiv_attr(
+    config_data,
+    ratio_attributes_remove=0.5,
+    seed=None,
+):
+    """
+    Remove a random fraction of individual AwA2 attributes, analogous to the
+    CUB individual-attribute removal helper.
+    """
+    if not 0 <= ratio_attributes_remove < 1:
+        raise ValueError("ratio_attributes_remove must be in [0, 1).")
+
+    num_attributes_remove = int(ratio_attributes_remove * N_CONCEPTS)
+    rng = random.Random(seed) if seed is not None else random
+    remove_attribute_indices = sorted(
+        rng.sample(range(N_CONCEPTS), num_attributes_remove)
+    )
+    remove_set = set(remove_attribute_indices)
+    selected_concepts = [idx for idx in range(N_CONCEPTS) if idx not in remove_set]
+
+    removed_per_group = {}
+    for group_name, indices in CONCEPT_GROUPS.items():
+        count = sum(idx in remove_set for idx in indices)
+        if count:
+            removed_per_group[group_name] = count
+
+    print(f"Removing individual AwA2 attributes: {remove_attribute_indices}")
+
+    return _save_incomplete_concept_set(
+        config_data,
+        selected_concepts=selected_concepts,
+        mode_name="individual",
+        metadata={
+            "mode": "remove individual attributes",
+            "ratio_attributes_removed": ratio_attributes_remove,
+            "number_attributes_removed": num_attributes_remove,
+            "number_removed_per_semantic_group": removed_per_group,
+            "seed": seed,
+        },
+    )
+
+
+# -----------------------------------------------------------------------------
+# Incomplete AwA2 creation: exact CEM-style sampling API
+# -----------------------------------------------------------------------------
+
+def create_cem_incomplete_dataset(
+    config_data,
+    sampling_percent=0.5,
+    sampling_groups=False,
+    seed=DEFAULT_SEED,
+):
+    """
+    Persist the same concept subsampling logic used by the CEM AwA2 loader.
+
+    Parameters
+    ----------
+    sampling_percent : float
+        FRACTION OF CONCEPTS/GROUPS TO KEEP, not the fraction to remove.
+        Example: sampling_percent=0.5 keeps approximately 50%.
+
+    sampling_groups : bool
+        False -> sample individual concepts.
+        True  -> sample entire semantic groups and keep all concepts belonging
+                 to the selected groups.
+
+    seed : int
+        Seed used for the NumPy permutation. Default 42.
+    """
+    if not 0 < sampling_percent <= 1:
+        raise ValueError("sampling_percent must be in (0, 1].")
+
+    rng = np.random.RandomState(seed)
+
+    if sampling_groups:
+        group_names = list(CONCEPT_GROUPS.keys())
+        new_n_groups = int(np.ceil(len(group_names) * sampling_percent))
+        selected_group_indices = sorted(
+            rng.permutation(len(group_names))[:new_n_groups].tolist()
+        )
+        selected_groups = [group_names[i] for i in selected_group_indices]
+
+        selected_concepts = []
+        for group_name in selected_groups:
+            selected_concepts.extend(CONCEPT_GROUPS[group_name])
+        selected_concepts = sorted(set(selected_concepts))
+
+        metadata = {
+            "mode": "CEM-style group sampling",
+            "sampling_percent_kept": sampling_percent,
+            "sampling_groups": True,
+            "selected_group_indices": selected_group_indices,
+            "selected_groups": selected_groups,
+            "seed": seed,
+        }
+        mode_name = "cem_groups"
+    else:
+        new_n_concepts = int(np.ceil(N_CONCEPTS * sampling_percent))
+        selected_concepts = sorted(
+            rng.permutation(N_CONCEPTS)[:new_n_concepts].tolist()
+        )
+        metadata = {
+            "mode": "CEM-style individual concept sampling",
+            "sampling_percent_kept": sampling_percent,
+            "sampling_groups": False,
+            "seed": seed,
+        }
+        mode_name = "cem_individual"
+
+    print(f"Selected original AwA2 concept indices: {selected_concepts}")
+
+    return _save_incomplete_concept_set(
+        config_data,
+        selected_concepts=selected_concepts,
+        mode_name=mode_name,
+        metadata=metadata,
+    )

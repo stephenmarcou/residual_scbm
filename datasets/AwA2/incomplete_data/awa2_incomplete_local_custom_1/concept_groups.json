@@ -1,0 +1,23 @@
+{
+  "color": [
+    0,
+    1
+  ],
+  "fur_pattern": [
+    2,
+    3
+  ],
+  "limb_shape": [
+    4,
+    5
+  ],
+  "biome": [
+    6
+  ],
+  "fierceness": [
+    7
+  ],
+  "social_mode": [
+    8
+  ]
+}

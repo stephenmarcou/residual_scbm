@@ -1,0 +1,10 @@
+mode: manually selected concepts
+num_original_concepts: 85
+num_remaining_concepts: 9
+num_removed_concepts: 76
+selected_concept_indices_original_space: [0, 4, 10, 12, 18, 22, 68, 78, 82]
+selected_concept_names: ['black', 'gray', 'stripes', 'hairless', 'flippers', 'paws', 'plains', 'fierce', 'solitary']
+removed_concept_indices_original_space: [1, 2, 3, 5, 6, 7, 8, 9, 11, 13, 14, 15, 16, 17, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 69, 70, 71, 72, 73, 74, 75, 76, 77, 79, 80, 81, 83, 84]
+removed_concept_names: ['white', 'blue', 'brown', 'orange', 'red', 'yellow', 'patches', 'spots', 'furry', 'toughskin', 'big', 'small', 'bulbous', 'lean', 'hands', 'hooves', 'pads', 'longleg', 'longneck', 'tail', 'chewteeth', 'meatteeth', 'buckteeth', 'strainteeth', 'horns', 'claws', 'tusks', 'smelly', 'flys', 'hops', 'swims', 'tunnels', 'walks', 'fast', 'slow', 'strong', 'weak', 'muscle', 'bipedal', 'quadrapedal', 'active', 'inactive', 'nocturnal', 'hibernate', 'agility', 'fish', 'meat', 'plankton', 'vegetation', 'insects', 'forager', 'grazer', 'hunter', 'scavenger', 'skimmer', 'stalker', 'newworld', 'oldworld', 'arctic', 'coastal', 'desert', 'bush', 'forest', 'fields', 'jungle', 'mountains', 'ocean', 'ground', 'water', 'tree', 'cave', 'timid', 'smart', 'group', 'nestspot', 'domestic']
+old_to_new_concept_index: {0: 0, 4: 1, 10: 2, 12: 3, 18: 4, 22: 5, 68: 6, 78: 7, 82: 8}
+requested_concept_names: ['black', 'gray', 'stripes', 'hairless', 'flippers', 'paws', 'plains', 'fierce', 'solitary']

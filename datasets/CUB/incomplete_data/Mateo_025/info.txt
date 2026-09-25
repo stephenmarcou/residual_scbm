@@ -1,0 +1,6 @@
+Mode: remove attribute groups
+Removed attribute groups: ['has_wing_color', 'has_upperparts_color', 'has_underparts_color', 'has_breast_pattern', 'has_back_color', 'has_tail_shape', 'has_upper_tail_color', 'has_throat_color', 'has_eye_color', 'has_forehead_color', 'has_under_tail_color', 'has_nape_color', 'has_belly_color', 'has_size', 'has_shape', 'has_back_pattern', 'has_belly_pattern', 'has_primary_color', 'has_leg_color', 'has_crown_color', 'has_wing_pattern']
+Removed attribute indices: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 45, 46, 47, 48, 49, 50, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 78, 79, 80, 81, 82, 83, 84, 85, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]
+Number of attribute groups removed: 21
+Total number of attributes removed: 90
+New attribute indices mapping: {0: 0, 1: 1, 2: 2, 3: 3, 37: 4, 38: 5, 39: 6, 40: 7, 41: 8, 42: 9, 43: 10, 44: 11, 51: 12, 52: 13, 76: 14, 77: 15, 86: 16, 87: 17, 88: 18, 99: 19, 100: 20, 101: 21}

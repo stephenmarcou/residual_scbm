@@ -1,0 +1,22 @@
+defaults:
+  - model_defaults # Inherit model_defaults arguments
+
+# --------------------------
+#         Model
+# --------------------------
+# Black-box baseline of Espinosa Zarlenga et al. (ICML 2025, "Avoiding Leakage Poisoning",
+# App. D.4): the Hybrid CBM architecture with the concept loss weight set to 0, i.e.
+#     encoder -> Linear(n_features, k + k') -> LeakyReLU -> linear head
+# trained on the task loss alone. No unit is aligned to a concept, so the run reports task
+# metrics only, cannot be intervened on (inference.py refuses run_interventions=True), and
+# its bottleneck is dumped as bottleneck.pt / res_mu.pt for post-hoc probing.
+model: 'dnn' # Model's name
+tag: 'baseline' # Model's tag for wandb logging
+concept_learning: 'none' # No concept channel; kept so code that prints / branches on it does not fail
+training_mode: 'joint' # The only mode the DNN supports: there is no concept stage to train first
+
+# Bottleneck width k + k'. null -> data.num_concepts + data.num_residuals, so the DNN has
+# exactly the capacity of the matching (S)CBM-residual run on the same (in)complete split.
+# Set an integer to override. The paper searched k' in {0, 50, 100, 200} and picked
+# k' = 200 for CUB and CUB-Incomplete (-> 312 and 222 with their concept counts).
+bottleneck_dim: null
