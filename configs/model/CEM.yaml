@@ -11,7 +11,6 @@ concept_learning: 'embedding' # Concept Embedding Model baseline
 # --------------------------
 #         Policy
 # --------------------------
-inter_policy: 'random,prob_unc' # Comma-separated intervention policies to determine which concept to intervene. Combinable options: ['random','prob_unc']
 inter_strategy: 'hard' # Interventions are performed by setting the concept to 0 or 1
 
 # --------------------------

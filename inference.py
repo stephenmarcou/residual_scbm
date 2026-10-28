@@ -82,60 +82,27 @@ def run(config):
             "run_interventions=True is not defined for the DNN baseline: it has no concept "
             "bottleneck to intervene on. Use run_inference=True only."
         )
-    # TravelingBirds full-render sweep: artifact-only, no evaluation log (see run_tb_render_sweep).
-    tb_all_renders = config.inference.get("tb_all_renders", False)
-
-    # Override the image root the eval split is read from, so the same photos can be evaluated on
-    # both backgrounds (see build_tb_retargeted_loader). None = the historical behaviour, where
-    # train_test_split_CUB picks the folder by split name.
-    tb_image_root = config.inference.get("tb_image_root", None)
-    if tb_image_root is not None:
-        # Validate the image root is test or train (backgrounds)
-        if tb_image_root not in TB_IMAGE_ROOTS:
-            raise ValueError(
-                f"inference.tb_image_root must be one of {list(TB_IMAGE_ROOTS)}, got {tb_image_root}."
-            )
-        if config.data.dataset != "TravelingBirds":
-            raise ValueError(
-                "inference.tb_image_root only applies to the TravelingBirds dataset, "
-                f"got data.dataset={config.data.dataset}."
-            )
-        if tb_all_renders:
-            raise ValueError(
-                "inference.tb_image_root and inference.tb_all_renders are mutually exclusive: "
-                "the sweep already covers every split against both image roots."
-            )
-
     # Input corruption for post-hoc robustness checks (datasets/noise.py). Applied to the
     # evaluation loader only: the checkpoint is fixed and the intervention strategy is still
     # fitted on the clean train split, so the noisy curve and the clean curve of the same run
     # differ only in the pixels the model sees at evaluation time. None = clean evaluation.
-    noise = parse_noise_config(config, tb_all_renders)
+    noise = parse_noise_config(config)
     noise_suffix = f"_noise_{noise['type']}_{noise['amount']:g}" if noise is not None else ""
 
 
     # --------------------------------
     # Folder naming to save artifacts and logs
     # -------------------------------
-    # 'test' with no root override keeps the historical file names; anything else gets its own log
-    # so a val run (or the other background) does not overwrite the test results of the same model.
-    if tb_image_root is not None:
-        # Same naming as the sweep, so both routes produce comparable folders.
-        split_suffix = f"_{eval_split}_bg_{tb_image_root}"
-    elif eval_split == "test":
-        split_suffix = ""
-    else:
-        split_suffix = f"_{eval_split}"
-    # Folder the c_mu/res_mu artifacts are dumped to; matches the split's own folder by default.
-    eval_save_folder = f"{eval_split}_bg_{tb_image_root}" if tb_image_root is not None else eval_split
+    # 'test' keeps the historical file names; any other split gets its own log so a val run
+    # does not overwrite the test results of the same model.
+    split_suffix = "" if eval_split == "test" else f"_{eval_split}"
+    # Folder the c_mu/res_mu artifacts are dumped to; matches the split's own folder.
+    eval_save_folder = eval_split
     # A corrupted evaluation never overwrites the clean logs / artifacts of the same run.
     split_suffix += noise_suffix
     eval_save_folder += noise_suffix
-    # Line recorded in both logs so a curve can be traced back to the background it was measured on.
+    # Line recorded in both logs so a curve can be traced back to the split it was measured on.
     split_header = f"{eval_split}"
-    if tb_image_root is not None:
-        background = "class-correlated" if tb_image_root == "train" else "random"
-        split_header += f" (images from TravelingBirds/{tb_image_root}/, {background} background)"
     if noise is not None:
         split_header += (
             f" [noise: {noise['type']}, amount={noise['amount']:g}, seed={noise['seed']}]"
@@ -145,21 +112,10 @@ def run(config):
     #   Logs
     #-------------------------------
     if config.run_inference == True:
-        if tb_all_renders:
-            # The sweep evaluates every split, so it gets its own log rather than an
-            # inference_log named after a single split (which is left untouched).
-            log_file_inference = experiment_path / "tb_render_sweep_log.txt"
-            with open(log_file_inference, "w") as f:
-                f.write(f"TravelingBirds render sweep log for experiment: {experiment_path}\n")
-                f.write(
-                    "Every split evaluated against both image roots: "
-                    "train/ = class-correlated background, test/ = random background.\n"
-                )
-        else:
-            log_file_inference = experiment_path / f"inference_log{split_suffix}.txt"
-            with open(log_file_inference, "w") as f:
-                f.write(f"Inference log for experiment: {experiment_path}\n")
-                f.write(f"Evaluation split: {split_header}\n")
+        log_file_inference = experiment_path / f"inference_log{split_suffix}.txt"
+        with open(log_file_inference, "w") as f:
+            f.write(f"Inference log for experiment: {experiment_path}\n")
+            f.write(f"Evaluation split: {split_header}\n")
 
 
     if config.run_interventions == True:
@@ -181,15 +137,7 @@ def run(config):
                 )
             prop_suffix = "_no_res_prop"
         policy_suffix += prop_suffix
-        if tb_image_root is not None:
-            # Keep the curve next to the c_mu/res_mu artifacts it was measured on, so a
-            # <split>_bg_<root>/ folder is self-contained. The folder normally already exists
-            # from an earlier inference run, but interventions can be run on their own.
-            log_dir = experiment_path / eval_save_folder
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / f"intervention_log{policy_suffix}.txt"
-        else:
-            log_file = experiment_path / f"intervention_log{split_suffix}{policy_suffix}.txt"
+        log_file = experiment_path / f"intervention_log{split_suffix}{policy_suffix}.txt"
         with open(log_file, "w") as f:
             f.write(f"Intervention log for experiment: {experiment_path}\n")
             f.write(f"Intervention split: {split_header}\n")
@@ -207,9 +155,8 @@ def run(config):
         # default: a 200-class sweep dumps ~50MB per run and the standard curve needs none of it.
         intervention_preds_dir = None
         if config.inference.get("save_intervention_predictions", False):
-            base_dir = log_dir if tb_image_root is not None else experiment_path
             intervention_preds_dir = (
-                base_dir / f"intervention_preds{split_suffix}{prop_suffix}"
+                experiment_path / f"intervention_preds{split_suffix}{prop_suffix}"
             )
             print(f"Saving per-intervention predictions to {intervention_preds_dir}")
 
@@ -250,18 +197,10 @@ def run(config):
 
     split_loader = {"train": train_loader, "val": val_loader, "test": test_loader}[eval_split]
 
-    # --------------------------------
-    # TravelingBirds background override, so we use the specified background
-    # --------------------------------
-    if tb_image_root is not None:
-        # Same records (same birds, same labels), read from the other rendering.
-        eval_loader = build_tb_retargeted_loader(config, split_loader, tb_image_root, noise=noise)
-        eval_records = eval_loader.dataset.data
-    elif noise is not None:
-        # Same records, same image root, deterministic test transform with the corruption
-        # inserted before normalization (see build_records_loader).
+    if noise is not None:
+        # Same records, deterministic test transform with the corruption inserted before
+        # normalization (see build_records_loader).
         eval_loader = build_records_loader(config, split_loader.dataset.data, noise=noise)
-        eval_records = None
     else:
         # The train/val loaders are shuffled, so wrap the chosen split in an analysis loader to get a
         # deterministic, complete pass (matters because the saved c_mu/res_mu artifacts are order-dependent).
@@ -271,7 +210,6 @@ def run(config):
             batch_size=config.model.val_batch_size,
             num_workers=config.workers,
         )
-        eval_records = None
 
 
     
@@ -323,26 +261,7 @@ def run(config):
             validate_one_epoch = validate_one_epoch_scbm_residual
             test_save_kwargs = {"save_residual_meta_data_folder": eval_save_folder}
 
-        #save_concept_target_pred = config.inference.save_concept_target_pred
-
-        # Artifact-only mode: the sweep already covers every split against both image roots,
-        # so the single-split evaluation and the default dumps below are skipped.
-        if tb_all_renders:
-            run_tb_render_sweep(
-                config,
-                {"train": train_loader, "val": val_loader, "test": test_loader},
-                validate_one_epoch,
-                model,
-                metrics,
-                t_epochs,
-                loss_fn,
-                device,
-                concept_names_graph,
-                log_file_inference,
-            )
-
-    # Still saves concept/residual information given config.data.save_concept_and_residual_channel=true
-    if config.run_inference == True and not tb_all_renders:
+        # Still saves concept/residual information given config.data.save_concept_and_residual_channel=true
         print(f"\nEVALUATION ON THE {split_header.upper()} SET:\n")
         validate_one_epoch(
             eval_loader,
@@ -358,24 +277,15 @@ def run(config):
             **test_save_kwargs,
         )
 
-        # eval_records = eval_loader.dataset.data if tb_image_root is not None else None
-        if eval_records is not None and config.data.save_concept_and_residual_channel:
-            # Lets the analysis verify row alignment between the two backgrounds: the two
-            # img_paths.txt differ only in the train/ vs test/ path component.
-            save_render_image_paths(
-                eval_records, os.path.join(experiment_path, eval_save_folder)
-            )
-
         # ---------------------------------------------------------
         # Save concept / residual meta data for analysis of concept discovery
         # ---------------------------------------------------------
         # Did inference and saved the c_mu/res_mu artifacts for eval_loader
         # Here we run a full pass over the other splits to save their c_mu/res_mu artifacts too
         # eval_loader is popped from the analysis_loaders dict so it is not re-run
-        # We do not do this if tb_image_root is set, as then we only want to do it for a very specific 
-        # split background combination. Nor under noise: the other splits would be dumped clean
-        # into the default train/, val/, test/ folders, re-deriving artifacts a clean run already made.
-        if config.data.save_concept_and_residual_channel and tb_image_root is None and noise is None:
+        # We do not do this under noise: the other splits would be dumped clean into the
+        # default train/, val/, test/ folders, re-deriving artifacts a clean run already made.
+        if config.data.save_concept_and_residual_channel and noise is None:
             save_kwarg = (
                 "save_residual_meta_data_folder"
                 if config.model.model in ("scbm_residual", "cbm_residual")
@@ -449,35 +359,7 @@ def run(config):
     return None
 
 
-# TravelingBirds ships two renderings of every CUB photo: <data_path>/TravelingBirds/train/
-# (class-correlated background) and <data_path>/TravelingBirds/test/ (random background),
-# 11788 files each. train_test_split_CUB picks the folder by split *name*, so a normal run
-# only ever sees one rendering per photo - half of the 23576 images on disk.
-TB_IMAGE_ROOTS = ("train", "test")
-
-
-def retarget_tb_records(records, data_path, image_root):
-    """Copy split records with img_path repointed at TravelingBirds/<image_root>/.
-
-    The labels are untouched: both renderings show the same bird, only the background differs.
-    """
-    retargeted = []
-    for record in records:
-        class_dir, file_name = record["img_path"].split("/")[-2:]
-        # Keep everything else, just change the image path to the TravelingBirds renderings
-        # The original attributes etc are preserved
-        retargeted.append(
-            {
-                **record,
-                "img_path": os.path.join(
-                    data_path, "TravelingBirds", image_root, class_dir, file_name
-                ),
-            }
-        )
-    return retargeted
-
-
-def parse_noise_config(config, tb_all_renders):
+def parse_noise_config(config):
     """inference.noise as a plain dict {type, amount, seed}, or None for a clean evaluation."""
     noise_cfg = config.inference.get("noise", None)
     noise_type = noise_cfg.get("type", None) if noise_cfg is not None else None
@@ -493,11 +375,6 @@ def parse_noise_config(config, tb_all_renders):
             f"inference.noise is only implemented for {list(CUB_CONCEPT_DATASETS)}, "
             f"got data.dataset={config.data.dataset}."
         )
-    if tb_all_renders:
-        raise ValueError(
-            "inference.noise and inference.tb_all_renders cannot be combined: the sweep is an "
-            "artifact-only pass over the clean renders."
-        )
     return {
         "type": noise_type,
         "amount": float(noise_cfg.get("amount")),
@@ -509,9 +386,9 @@ def build_records_loader(config, records, noise=None):
     """Deterministic loader over CUB-family records with the test-time transform.
 
     shuffle=False / drop_last=False, so row i of every saved tensor is records[i] and two
-    passes over the same records (clean vs noisy, or the two TravelingBirds backgrounds) stay
-    sample-aligned. With `noise`, the corruption is applied in [0, 1] pixel space between the
-    geometric part of the test transform and its Normalize step (datasets/noise.py).
+    passes over the same records (clean vs noisy) stay sample-aligned. With `noise`, the
+    corruption is applied in [0, 1] pixel space between the geometric part of the test
+    transform and its Normalize step (datasets/noise.py).
     """
     _, test_transform = get_CUB_transforms()
     if noise is None:
@@ -534,127 +411,6 @@ def build_records_loader(config, records, noise=None):
         pin_memory=True,
         persistent_workers=config.workers > 0,
     )
-
-
-def build_tb_retargeted_loader(config, loader, image_root, noise=None):
-    """Deterministic loader over a split's records, read from TravelingBirds/<image_root>/.
-
-    shuffle=False / drop_last=False plus the test-time transform, so the passes over the two
-    image roots are sample-aligned: row i is the same bird with the same labels, only the
-    background differs. That pairing is the point of the override - comparing a split against
-    itself on both backgrounds isolates the background, whereas val-vs-test also swaps the
-    photographers. `noise` corrupts the retargeted images (see build_records_loader).
-    """
-    records = retarget_tb_records(loader.dataset.data, config.data.data_path, image_root)
-    return build_records_loader(config, records, noise=noise)
-
-
-def save_render_image_paths(records, folder_path):
-    """Write the image paths of one sweep pass, in loader order, next to its artifacts.
-
-    The render loaders are shuffle=False / drop_last=False, so row i of c_res_mu.pt (and of
-    every other saved tensor) is the image on line i of img_paths.txt. Row i of
-    <split>_bg_train and of <split>_bg_test is therefore the same photo on the two
-    backgrounds, which is exactly what the paths file lets you verify.
-    """
-    Path(folder_path).mkdir(parents=True, exist_ok=True)
-    paths_file = os.path.join(folder_path, "img_paths.txt")
-    with open(paths_file, "w") as f:
-        f.write("\n".join(record["img_path"] for record in records) + "\n")
-
-    # Cross-check against an artifact every model type saves: a length mismatch means the
-    # pass did not produce one row per record, and the pairing would be silently misaligned.
-    y_true_path = os.path.join(folder_path, "y_true.pt")
-    if os.path.exists(y_true_path):
-        num_rows = len(torch.load(y_true_path, map_location="cpu"))
-        if num_rows != len(records):
-            raise RuntimeError(
-                f"{folder_path}: {num_rows} saved rows but {len(records)} image paths."
-            )
-    print(f"Saved {len(records)} image paths to {paths_file}")
-
-
-def run_tb_render_sweep(
-    config,
-    loaders,
-    validate_one_epoch,
-    model,
-    metrics,
-    t_epochs,
-    loss_fn,
-    device,
-    concept_names_graph,
-    log_file,
-):
-    """Forward pass over every split x every TravelingBirds image root (all 23576 renders).
-
-    Each pass uses the deterministic test-time transform, so the six combinations are directly
-    comparable, and dumps its concept/residual artifacts to <split>_bg_<root>/ (only when
-    data.save_concept_and_residual_channel is set). log_file is the sweep's own log
-    (tb_render_sweep_log.txt); it also determines the run directory the artifacts land in,
-    since validate_one_epoch derives that from the log file's parent.
-    """
-    if config.data.dataset != "TravelingBirds":
-        raise ValueError(
-            "inference.tb_all_renders only applies to the TravelingBirds dataset, "
-            f"got data.dataset={config.data.dataset}."
-        )
-    if not config.data.save_concept_and_residual_channel:
-        # The artifacts are the only output of this mode, so 23576 forward passes would
-        # otherwise be thrown away.
-        raise ValueError(
-            "inference.tb_all_renders needs data.save_concept_and_residual_channel=True, "
-            "otherwise the sweep saves nothing."
-        )
-
-    # Residual models save under the residual-flavoured kwarg; validate_one_epoch_cbm accepts both.
-    save_kwarg = (
-        "save_residual_meta_data_folder"
-        if config.model.model in ("scbm_residual", "cbm_residual")
-        else "save_concept_meta_data_folder"
-    )
-    for split, loader in loaders.items():
-        for image_root in TB_IMAGE_ROOTS:
-            # Same records, read from this rendering (see build_tb_retargeted_loader).
-            # The loader is shuffle=False / drop_last=False, also get test_transform
-            render_loader = build_tb_retargeted_loader(config, loader, image_root)
-            records = render_loader.dataset.data
-
-            folder = f"{split}_bg_{image_root}"
-            header = (
-                f"\nsplit: {split}, image root: {image_root}/ "
-                f"({len(records)} images) -> {folder}/"
-            )
-            print(header)
-
-            # metrics_only_for_saving keeps validate_one_epoch from writing its own
-            # "Validation:" line and from overwriting the same wandb keys six times over;
-            # the metrics are recorded below under a name identifying the combination.
-            metrics_dict = validate_one_epoch(
-                render_loader,
-                model,
-                metrics,
-                t_epochs,
-                config,
-                loss_fn,
-                device,
-                test=False,
-                concept_names_graph=concept_names_graph,
-                log_file=log_file,
-                metrics_only_for_saving=True,
-                **{save_kwarg: folder},
-            )
-
-            save_render_image_paths(records, os.path.join(os.path.dirname(log_file), folder))
-
-            summary = " ".join(f"{k}: {v:.3f}" for k, v in metrics_dict.items())
-            print(summary + "\n")
-            with open(log_file, "a") as f:
-                f.write(header + "\n" + summary + "\n")
-            wandb.log(
-                {f"tb_render_sweep/{folder}/{k}": v for k, v in metrics_dict.items()}
-            )
-
 
 
 def get_experiment_path(config):

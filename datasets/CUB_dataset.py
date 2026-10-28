@@ -39,10 +39,7 @@ from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 
 
-# TravelingBirds is CUB with the backgrounds swapped: same 200 classes, same 112
-# attributes, same photographer split, same pkl label files. Only the image root differs,
-# so every CUB code path applies unchanged.
-CUB_FAMILY_DATASETS = ("CUB", "TravelingBirds")
+CUB_FAMILY_DATASETS = ("CUB",)
 
 # Folder under data_path holding the label pkls and the attribute metadata. Shared by the
 # whole CUB family, including the incomplete splits.
@@ -285,8 +282,6 @@ def train_test_split_CUB(config, incomplete):
     data_val = []
     data_test = []
     
-    # Labels always come from the CUB folder, also for TravelingBirds: the two datasets
-    # share the split and the attribute annotations, only the images differ.
     if not incomplete:
         full_train_pkl_path = os.path.join(config.data_path, CUB_LABEL_ROOT, "class_attr_data_10", "train.pkl")
         full_val_pkl_path = os.path.join(config.data_path, CUB_LABEL_ROOT, "class_attr_data_10", "val.pkl")
@@ -339,24 +334,6 @@ def train_test_split_CUB(config, incomplete):
                 dataset[i]["img_path"] = os.path.join(
                     config.data_path, "CUB/CUB_200_2011/CUB_200_2011/", end_path
                 )
-                
-            elif config.dataset == "TravelingBirds":
-                parts = dataset[i]["img_path"].split("/")
-                index = parts.index("images")
-                # For TravelingBirds, the images are stored in train/ and test/ subfolders. No need for the "images" folder in the path.
-                end_path = "/".join(parts[index+1:])
-                
-                
-                
-                if split_name == "train" or split_name == "val":
-                    dataset[i]["img_path"] = os.path.join(
-                        config.data_path, "TravelingBirds/train/", end_path
-                    )
-                else:
-                    dataset[i]["img_path"] = os.path.join(
-                        config.data_path, "TravelingBirds/test/", end_path
-                    )
-                
 
     return data_train, data_val, data_test
 

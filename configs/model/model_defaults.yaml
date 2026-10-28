@@ -27,10 +27,10 @@ num_monte_carlo: 100 # Number of MC samples when drawing from concept distributi
 straight_through: True # If Gumbel-Softmax, whether to do straight-through or not [True, False]
 
 # Intervention 
-max_interventions: 200 # I added
+max_interventions: 200 # Maximum number of intervention steps on the curve (capped at num_concepts / num_groups)
 
 # Regression task
-regression_task: False # Whether the task is regression or classification. If True, the model
+regression_task: False # Whether the task is regression instead of classification [True, False]
 
 # Multilabel task
 multilabel_task: False # Whether the task is multilabel classification or not. If True, the model will use a sigmoid activation for the output layer and binary cross-entropy loss. If False, the model will use a softmax activation for the output layer and cross-entropy loss.
@@ -38,17 +38,11 @@ multilabel_task: False # Whether the task is multilabel classification or not. I
 # --------------------------
 #   Pretrained encoder
 # --------------------------
-# Initialise the encoder from a checkpoint saved for the encoder alone (a state_dict
-# for just that module, e.g. experiments/backbones/<name>/encoder.pt as written by
-# encoder_capacity_check.ipynb §10b). null -> the usual random init.
-#
-# The checkpoint must match encoder_arch AND have been pretrained at the same
-# data.corruption_strength the run trains at -- otherwise frozen features are reading
-# an input distribution they were never fitted on.
+# Initialise the encoder from a checkpoint saved for the encoder alone (a state_dict for
+# just that module). Must match encoder_arch. null -> the usual random init.
 pretrained_encoder_path: null
 
-# Hold those weights fixed. This does two things (see load_and_maybe_freeze_encoder in
-# models/models.py): requires_grad=False so the optimiser skips them, AND the encoder is
-# pinned to eval mode so BatchNorm running stats and Dropout stop changing. Both are
-# required -- model.train() would otherwise undo the second every epoch.
+# Hold those weights fixed: requires_grad=False and the encoder pinned to eval mode so
+# BatchNorm running stats and Dropout stop changing (see load_and_maybe_freeze_encoder in
+# models/models.py).
 freeze_encoder: false

@@ -79,13 +79,13 @@ Every argument is a Hydra override. `+model=` and `+data=` select the config gro
 python train.py +model=SCBM_RES +data=CUB seed=0 \
     incomplete=True data.pkl_file_dir=incomplete_cub/ \
     data.num_residuals=20 model.use_L_int_extension_loss=True \
-    save_model=True
+    model.inter_strategy=emp_perc save_model=True
 
 # Res-SCBM w/o L_int: drop the loss flag
 # SCBM / Hard CBM / CEM / black-box DNN:
 python train.py +model=SCBM  +data=CUB seed=0 incomplete=True data.pkl_file_dir=incomplete_cub/
-python train.py +model=CBM   +data=CUB seed=0 incomplete=True data.pkl_file_dir=incomplete_cub/
-python train.py +model=CEM   +data=CUB seed=0 incomplete=True data.pkl_file_dir=incomplete_cub/ model.p_int=0.25
+python train.py +model=CBM   +data=CUB seed=0 incomplete=True data.pkl_file_dir=incomplete_cub/ model.inter_strategy=hard
+python train.py +model=CEM   +data=CUB seed=0 incomplete=True data.pkl_file_dir=incomplete_cub/ model.inter_strategy=hard model.p_int=0.25
 python train.py +model=DNN   +data=CUB seed=0 incomplete=True data.pkl_file_dir=incomplete_cub/
 
 # Linear head on ground-truth concepts (the reference row of Table 1)
@@ -93,7 +93,14 @@ python eval_datasets.py +model=target_head +data=CUB seed=0 incomplete=True data
 ```
 
 Swap `+data=AwA2` and `data.pkl_file_dir=awa2_incomplete_local_custom_1` for the AwA2
-tasks, and drop `incomplete=True` for the complete ones. The paper reports three seeds,
+tasks, and drop `incomplete=True` for the complete ones.
+
+**Intervention strategy (`model.inter_strategy`):**
+- Res-SCBM with L_int: use `emp_perc`. The L_int loss intervenes during training
+  with this strategy.
+- Hard CBM and CEM: use `hard`, which sets each intervened concept to 0 or 1.
+
+The paper reports three seeds,
 `seed=0`, `10` and `20`. Run the Python entry points directly from the repository root;
 for example, use `python train.py` for training and `python inference.py` for
 post-hoc evaluation.
@@ -109,8 +116,12 @@ Intervention curves are produced post-hoc from a saved checkpoint:
 ```bash
 python inference.py +model=SCBM_RES +data=CUB \
     inference.ex_name=<run_folder_name> incomplete=True \
-    run_inference=True run_interventions=True
+    run_inference=True run_interventions=True \
+    model.inter_strategy=<strategy>
 ```
+
+Set `<strategy>` as in the training section: `emp_perc` for Res-SCBM with L_int, `hard`
+for CBM and CEM.
 
 This writes `inference_log.txt` (test-set metrics) and `intervention_log.txt` (one line
 per intervention step) inside the run folder. With `incomplete=True` the run's concept

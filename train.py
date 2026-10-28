@@ -600,7 +600,6 @@ def train(config):
 
 
 def check_CUB_data(config):
-    # Incomplete splits only touch the labels, so CUB and TravelingBirds share them.
     full_path_pkl_dir = os.path.join(config.data.data_path, CUB_LABEL_ROOT, "incomplete_data", config.data.pkl_file_dir)
 
 

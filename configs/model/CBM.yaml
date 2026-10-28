@@ -11,5 +11,4 @@ concept_learning: 'hard' # Concept Bottleneck Model baseline, either hard {0,1} 
 # --------------------------
 #         Policy
 # --------------------------
-inter_policy: 'random,prob_unc' # Comma-separated intervention policies to determine which concept to intervene. Combinable options: ['random','prob_unc']
 inter_strategy: 'simple_perc,emp_perc' # Comma-separated intervention strategies to determine how to perform interventions. Automatically set to 'hard' if using hard CBM ['simple_perc', 'emp_perc']
